@@ -2,6 +2,8 @@ pub mod controller;
 use serde::Deserialize;
 use std::{
     fs,
+    thread,
+    time::Duration,
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
@@ -117,8 +119,7 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             TRAY_SHOW_ID => restore_main_window(app),
             TRAY_QUIT_ID => {
-                let settings = app.state::<RuntimeSettings>();
-                settings.is_quitting.store(true, Ordering::Relaxed);
+                prepare_controller_shutdown(app);
                 app.exit(0);
             }
             _ => {}
@@ -140,6 +141,19 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 
     tray_builder.build(app)?;
     Ok(())
+}
+
+fn prepare_controller_shutdown<R: Runtime>(app: &AppHandle<R>) {
+    let settings = app.state::<RuntimeSettings>();
+    if settings.is_quitting.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let app_state = app.state::<controller::AppState>();
+    controller::reset_on_exit(app_state.controller.clone());
+
+    // Give the controller listener a short window to flush the reset report.
+    thread::sleep(Duration::from_millis(40));
 }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -370,6 +384,8 @@ pub fn run() {
                 if close_to_tray {
                     api.prevent_close();
                     hide_main_window_to_tray(window);
+                } else {
+                    prepare_controller_shutdown(&window.app_handle());
                 }
             }
         })

@@ -11,7 +11,8 @@ use vigem_client::{Client, TargetId, XButtons, XGamepad};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT, VIRTUAL_KEY,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, VIRTUAL_KEY,
 };
 
 const SONY_VID: u16 = 0x054C;
@@ -21,6 +22,7 @@ const DUALSENSE_PID_BT: u16 = 0x0DF2;
 const TAP_TIMEOUT_MS: u128 = 180;
 const TAP_MAX_DISTANCE_SQ: i32 = 900;
 const MOVE_DEAD_ZONE_SQ: i32 = 100;
+const TOUCHPAD_SCROLL_FACTOR: f64 = 0.65;
 const TOUCHPAD_MID_X: i32 = 960;
 const INPUT_EVENT_INTERVAL_MS: u128 = 33;
 const FIRMWARE_REPORT_SET_TEST: u8 = 0x80;
@@ -321,6 +323,8 @@ struct DualSenseInputState {
     finger0_x: i32,
     finger0_y: i32,
     touching_1: bool,
+    finger1_x: i32,
+    finger1_y: i32,
 }
 
 impl DualSenseInputState {
@@ -368,6 +372,7 @@ pub struct ControllerState {
     pub touch_start_y: i32,
     pub touch_moved: bool,
     pub peak_finger_count: u8,
+    pub last_touch_finger_count: u8,
     pub click_held_button: Option<MouseButton>,
     pub last_tap_time: Option<Instant>,
     pub last_tap_button: Option<MouseButton>,
@@ -432,6 +437,7 @@ impl AppState {
                 touch_start_y: 0,
                 touch_moved: false,
                 peak_finger_count: 0,
+                last_touch_finger_count: 0,
                 click_held_button: None,
                 last_tap_time: None,
                 last_tap_button: None,
@@ -879,6 +885,27 @@ fn send_mouse_move(dx: i32, dy: i32) {
 fn send_mouse_move(_dx: i32, _dy: i32) {}
 
 #[cfg(windows)]
+fn send_mouse_scroll(delta: i32) {
+    if delta == 0 {
+        return;
+    }
+
+    unsafe {
+        let mut input = INPUT::default();
+        input.r#type = INPUT_MOUSE;
+        input.Anonymous.mi = MOUSEINPUT {
+            mouseData: delta as u32,
+            dwFlags: MOUSEEVENTF_WHEEL,
+            ..Default::default()
+        };
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(not(windows))]
+fn send_mouse_scroll(_delta: i32) {}
+
+#[cfg(windows)]
 fn send_mouse_button(button: MouseButton, down: bool) {
     unsafe {
         let mut input = INPUT::default();
@@ -1074,7 +1101,8 @@ fn parse_input_report(buf: &[u8], bytes_read: usize) -> Option<DualSenseInputSta
         pressed_buttons.insert(ControllerButton::Mute);
     }
 
-    let (touching_0, finger0_x, finger0_y, touching_1, _, _) = if bytes_read >= 41 {
+    let (touching_0, finger0_x, finger0_y, touching_1, finger1_x, finger1_y) =
+        if bytes_read >= 41 {
         parse_touchpad(buf)
     } else {
         (false, 0, 0, false, 0, 0)
@@ -1092,6 +1120,8 @@ fn parse_input_report(buf: &[u8], bytes_read: usize) -> Option<DualSenseInputSta
         finger0_x,
         finger0_y,
         touching_1,
+        finger1_x,
+        finger1_y,
     })
 }
 
@@ -1453,6 +1483,7 @@ fn reset_touchpad_tracking(state: &mut ControllerState) {
     state.touch_start_y = 0;
     state.touch_moved = false;
     state.peak_finger_count = 0;
+    state.last_touch_finger_count = 0;
     state.last_tap_time = None;
     state.last_tap_button = None;
     state.drag_active = false;
@@ -1642,6 +1673,8 @@ fn handle_touchpad_mouse(state: &mut ControllerState, input: &DualSenseInputStat
     let touching_1 = input.touching_1;
     let fx = input.finger0_x;
     let fy = input.finger0_y;
+    let finger1_x = input.finger1_x;
+    let finger1_y = input.finger1_y;
     let pad_button = input.pressed(ControllerButton::Touchpad);
     let sensitivity = state.touchpad_sensitivity;
 
@@ -1658,6 +1691,17 @@ fn handle_touchpad_mouse(state: &mut ControllerState, input: &DualSenseInputStat
     }
 
     if touching_0 {
+        let current_x = if finger_count >= 2 {
+            (fx + finger1_x) / 2
+        } else {
+            fx
+        };
+        let current_y = if finger_count >= 2 {
+            (fy + finger1_y) / 2
+        } else {
+            fy
+        };
+
         if !state.last_touch_active {
             let is_follow_up = state
                 .last_tap_time
@@ -1674,16 +1718,27 @@ fn handle_touchpad_mouse(state: &mut ControllerState, input: &DualSenseInputStat
             }
 
             state.touch_start_time = Some(Instant::now());
-            state.touch_start_x = fx;
-            state.touch_start_y = fy;
+            state.touch_start_x = current_x;
+            state.touch_start_y = current_y;
             state.touch_moved = false;
-            state.last_touch_x = Some(fx);
-            state.last_touch_y = Some(fy);
+            state.last_touch_x = Some(current_x);
+            state.last_touch_y = Some(current_y);
             state.last_touch_active = true;
+            state.last_touch_finger_count = finger_count;
         } else {
+            if finger_count != state.last_touch_finger_count {
+                state.touch_start_time = Some(Instant::now());
+                state.touch_start_x = current_x;
+                state.touch_start_y = current_y;
+                state.touch_moved = false;
+                state.last_touch_x = Some(current_x);
+                state.last_touch_y = Some(current_y);
+                state.last_touch_finger_count = finger_count;
+            }
+
             if !state.touch_moved && !state.drag_active {
-                let dsx = fx - state.touch_start_x;
-                let dsy = fy - state.touch_start_y;
+                let dsx = current_x - state.touch_start_x;
+                let dsy = current_y - state.touch_start_y;
                 if dsx * dsx + dsy * dsy > MOVE_DEAD_ZONE_SQ {
                     state.touch_moved = true;
                 }
@@ -1691,16 +1746,26 @@ fn handle_touchpad_mouse(state: &mut ControllerState, input: &DualSenseInputStat
 
             if state.touch_moved || state.drag_active {
                 if let (Some(lx), Some(ly)) = (state.last_touch_x, state.last_touch_y) {
-                    let dx = ((fx - lx) as f64 * sensitivity) as i32;
-                    let dy = ((fy - ly) as f64 * sensitivity) as i32;
-                    if dx != 0 || dy != 0 {
+                    if finger_count >= 2 && !state.drag_active {
+                        let scroll_delta =
+                            (-(current_y - ly) as f64 * sensitivity * TOUCHPAD_SCROLL_FACTOR)
+                                .round() as i32;
+                        if scroll_delta != 0 {
+                            send_mouse_scroll(scroll_delta);
+                        }
+                    } else {
+                        let dx = ((current_x - lx) as f64 * sensitivity) as i32;
+                        let dy = ((current_y - ly) as f64 * sensitivity) as i32;
+                        if dx != 0 || dy != 0 {
                         send_mouse_move(dx, dy);
+                        }
                     }
                 }
             }
 
-            state.last_touch_x = Some(fx);
-            state.last_touch_y = Some(fy);
+            state.last_touch_x = Some(current_x);
+            state.last_touch_y = Some(current_y);
+            state.last_touch_finger_count = finger_count;
         }
     } else if state.last_touch_active {
         let is_tap = state
@@ -1742,6 +1807,7 @@ fn handle_touchpad_mouse(state: &mut ControllerState, input: &DualSenseInputStat
         state.last_touch_active = false;
         state.touch_start_time = None;
         state.peak_finger_count = 0;
+        state.last_touch_finger_count = 0;
     }
 
     if pad_button && !state.last_pad_button {
@@ -2116,6 +2182,36 @@ pub fn set_rumble(state: Arc<Mutex<ControllerState>>, left: u8, right: u8) {
     s.rumble_left = left;
     s.rumble_right = right;
     s.output_dirty = true;
+}
+
+pub fn reset_on_exit(state: Arc<Mutex<ControllerState>>) {
+    let mut s = lock_state(&state);
+    release_binding_outputs(&mut s);
+    release_touchpad_outputs(&mut s);
+    reset_touchpad_tracking(&mut s);
+
+    s.touchpad_enabled = false;
+    s.touchpad_sensitivity = 1.0;
+    s.mapping_profile = default_disabled_profile();
+
+    s.left_mode = 0;
+    s.left_force = 0;
+    s.left_start = 0;
+    s.left_end = 180;
+    s.left_frequency = 30;
+    s.right_mode = 0;
+    s.right_force = 0;
+    s.right_start = 0;
+    s.right_end = 180;
+    s.right_frequency = 30;
+    s.rumble_left = 0;
+    s.rumble_right = 0;
+
+    // Clear the custom lightbar on exit so the controller returns to a neutral state.
+    s.r = 0;
+    s.g = 0;
+    s.b = 0;
+    s.output_dirty = s.connected;
 }
 
 pub fn start_controller_listener(state: Arc<Mutex<ControllerState>>, app_handle: AppHandle) {

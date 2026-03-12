@@ -1540,7 +1540,7 @@ function App() {
                         <h3 className="text-lg font-semibold mb-1">Touchpad as Mouse</h3>
                         <p className="text-white/50 text-sm leading-relaxed">
                           Use the DualSense touchpad to control the mouse cursor. Single-finger swipe moves the cursor, 
-                          touchpad click with one finger for left click, two fingers for right click.
+                          two-finger swipe scrolls, and touchpad click with one finger for left click, two fingers for right click.
                         </p>
                       </div>
                     </div>
