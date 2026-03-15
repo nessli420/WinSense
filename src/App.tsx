@@ -1,9 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Battery,
+  Bluetooth,
   ChevronDown,
   Gamepad2,
+  Info,
   Keyboard,
+  Loader2,
+  Mic,
+  MicOff,
   Minus,
   MousePointer,
   Palette,
@@ -13,73 +18,111 @@ import {
   Save,
   Settings,
   Sliders,
+  Speaker,
   Square,
   Trash2,
   Usb,
+  Volume2,
+  VolumeX,
   X,
   Zap,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BaseDirectory, writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import { disable as disableAutostart, enable as enableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import winSenseMark from "../winsense-square.png";
+import { DEFAULT_AUDIO } from "./audio";
 import {
-  CONTROLLER_BUTTONS,
+  computeAdaptiveTriggerPreview,
+  computeNeedForSpeedHeatAdaptiveTriggersForSpeed,
+  defaultAdaptiveTriggerSettings,
+} from "./adaptiveTriggers";
+import {
+  BUILTIN_LIGHTING_PROFILES,
+  DEFAULT_LIGHTING,
+  clampPercent,
+  cloneLightingColor,
+  cloneLightingProfile,
+  computeLightingColor,
+  createCustomLightingProfileDraft,
+  defaultLightingProfile,
+  getLightingProfile,
+  usesAccentColor,
+} from "./lighting";
+import {
+  DEFAULT_TRIGGER_EFFECT,
   DEFAULT_CALIBRATION_PROFILE,
   EMPTY_LIVE_INPUT,
   EMPTY_FIRMWARE_STATUS,
-  KEY_OPTIONS,
-  MOUSE_BUTTON_OPTIONS,
-  XBOX_BUTTON_OPTIONS,
-  XBOX_STICK_OPTIONS,
-  XBOX_TRIGGER_OPTIONS,
+  EMPTY_GAME_TELEMETRY_STATUS,
+  cloneAdaptiveTriggerSettings,
   cloneCalibrationProfile,
+  cloneHapticProfile,
   cloneMappingProfile,
+  cloneTriggerEffect,
+  convertMappingProfileEmulationTarget,
+  createButtonBindingTarget,
   getButtonBinding,
+  migrateLegacyTriggerEffect,
+  normalizeMappingProfile,
+  normalizeAdaptiveTriggerSettings,
+  normalizeTriggerEffect,
   toManualProfile,
 } from "./mapping";
+import {
+  APP_STATE_SCHEMA_VERSION,
+  APP_STATE_FILE,
+  HAPTIC_PROFILES_FILE,
+  LEGACY_PROFILE_FILE,
+  LIGHTING_PROFILES_FILE,
+  MAPPING_PROFILES_FILE,
+  TRIGGER_PROFILES_FILE,
+  type StartupOpenMode,
+  createRuntimeSettingsSnapshot,
+  loadPersistedJson,
+  loadVersionedAppState,
+  normalizeStartupOpenMode,
+  writeJsonFile,
+} from "./persistence";
+import { generateLightingProfileId, generateMappingProfileId } from "./profileIds";
+import {
+  BUILTIN_HAPTIC_PROFILES,
+  TRIGGER_EFFECT_DEFINITIONS,
+  createHapticProfileDraft,
+  describeTriggerEffect,
+  getTriggerEffectDefinition,
+} from "./triggers";
+import { CalibrationPanel } from "./components/calibration/CalibrationPanel";
+import { MappingEditor } from "./components/mapping/MappingEditor";
 import "./App.css";
 import type {
+  ActiveProcessOption,
+  AdaptiveTriggerSettings,
+  AudioSettings,
   CalibrationCapabilities,
   CalibrationProfile,
   ButtonBindingTarget,
+  ConnectionTransport,
   ControllerButton,
   FirmwareCalibrationStatus,
-  KeyCode,
+  GameTelemetryStatus,
+  HapticProfile,
+  LightingColor,
+  LightingEffect,
+  LightingProfile,
+  LightingSettings,
   LiveInputSnapshot,
   MappingProfile,
-  MouseButton,
   PersistedAppState,
+  OcrCalibrationRegion,
   StickBinding,
-  StickSnapshot,
+  TriggerEffect,
+  TriggerEffectKind,
   TriggerBinding,
-  TriggerSnapshot,
-  XboxButton,
-  XboxStick,
-  XboxTrigger,
 } from "./mapping";
 
 const appWindow = getCurrentWindow();
-
-interface TriggerConfig {
-  mode: number;
-  force: number;
-  startPos: number;
-  endPos: number;
-  frequency: number;
-}
-
-interface HapticProfile {
-  id: string;
-  name: string;
-  builtIn: boolean;
-  left: TriggerConfig;
-  right: TriggerConfig;
-}
-
-type StartupOpenMode = "normal" | "tray";
 
 interface ToastState {
   title: string;
@@ -87,67 +130,71 @@ interface ToastState {
   tone: "success" | "error";
 }
 
-const DEFAULT_TRIGGER: TriggerConfig = { mode: 0, force: 0, startPos: 0, endPos: 180, frequency: 30 };
-
-const BUILTIN_PROFILES: HapticProfile[] = [
-  {
-    id: "builtin-fps", name: "FPS Resistance", builtIn: true,
-    left: { mode: 2, force: 180, startPos: 60, endPos: 160, frequency: 30 },
-    right: { mode: 2, force: 200, startPos: 40, endPos: 180, frequency: 30 },
-  },
-  {
-    id: "builtin-racing", name: "Racing Vibration", builtIn: true,
-    left: { mode: 6, force: 140, startPos: 0, endPos: 180, frequency: 40 },
-    right: { mode: 6, force: 160, startPos: 0, endPos: 180, frequency: 25 },
-  },
-  {
-    id: "builtin-heavy", name: "Heavy Feedback", builtIn: true,
-    left: { mode: 39, force: 200, startPos: 0, endPos: 255, frequency: 30 },
-    right: { mode: 39, force: 220, startPos: 0, endPos: 255, frequency: 35 },
-  },
-];
-
-const MODE_LABELS: Record<number, string> = {
-  0: "Normal (Off)",
-  1: "Continuous Resistance",
-  2: "Section Resistance",
-  6: "Vibration",
-  39: "Machine Gun",
-};
-
-function generateId() {
-  return "hp-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+interface OcrCalibrationPreviewPayload {
+  imageDataUrl: string;
+  width: number;
+  height: number;
 }
 
-function generateMappingProfileId() {
-  return "mp-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+interface OcrCalibrationDraft {
+  originX: number;
+  originY: number;
+  width: number;
+  height: number;
 }
 
-const clampU8 = (v: number) => Math.max(0, Math.min(255, Math.round(v || 0)));
-const APP_STATE_FILE = "app-state.json";
-const HAPTIC_PROFILES_FILE = "haptic-profiles.json";
-const MAPPING_PROFILES_FILE = "mapping-profiles.json";
-const LEGACY_PROFILE_FILE = "profile.json";
 const AUTOSAVE_DELAY_MS = 450;
 const TOAST_DURATION_MS = 2800;
+const clampU8 = (value: number) => Math.max(0, Math.min(255, Math.round(value || 0)));
+
+const getTransportLabel = (transport: ConnectionTransport) => {
+  if (transport === "bluetooth") return "Bluetooth";
+  if (transport === "usb") return "USB";
+  return "Detecting";
+};
+
+const getTelemetryToneClasses = (stage: GameTelemetryStatus["stage"]) => {
+  if (stage === "attached") return "border-emerald-500/30 bg-emerald-500/10 text-emerald-200";
+  if (stage === "gameDetected") return "border-blue-500/30 bg-blue-500/10 text-blue-200";
+  if (stage === "telemetryUnavailable" || stage === "telemetryStale") {
+    return "border-amber-500/30 bg-amber-500/10 text-amber-200";
+  }
+  if (stage === "error") return "border-red-500/30 bg-red-500/10 text-red-200";
+  return "border-white/10 bg-white/5 text-white/70";
+};
 
 function App() {
   const [activeTab, setActiveTab] = useState("dashboard");
   const [isConnected, setIsConnected] = useState(false);
-  const [lightingEnabled, setLightingEnabled] = useState(true);
-  const [rgb, setRgb] = useState({ r: 0, g: 0, b: 255 });
-  const [leftTrigger, setLeftTrigger] = useState<TriggerConfig>({ ...DEFAULT_TRIGGER });
-  const [rightTrigger, setRightTrigger] = useState<TriggerConfig>({ ...DEFAULT_TRIGGER });
+  const [appInitialized, setAppInitialized] = useState(false);
+  const [showStartupSplash, setShowStartupSplash] = useState(true);
+  const [startupSplashExiting, setStartupSplashExiting] = useState(false);
+  const [lightingEnabled, setLightingEnabled] = useState(DEFAULT_LIGHTING.enabled);
+  const [customLightingProfiles, setCustomLightingProfiles] = useState<LightingProfile[]>([]);
+  const [activeLightingProfileId, setActiveLightingProfileId] = useState<string | null>(DEFAULT_LIGHTING.profileId);
+  const [lightingDraft, setLightingDraft] = useState<LightingProfile>(defaultLightingProfile());
+  const [lightingPreviewRgb, setLightingPreviewRgb] = useState<LightingColor>({ ...DEFAULT_LIGHTING.profile.color });
+  const [leftTrigger, setLeftTrigger] = useState<TriggerEffect>(cloneTriggerEffect(DEFAULT_TRIGGER_EFFECT));
+  const [rightTrigger, setRightTrigger] = useState<TriggerEffect>(cloneTriggerEffect(DEFAULT_TRIGGER_EFFECT));
+  const [customHapticProfiles, setCustomHapticProfiles] = useState<HapticProfile[]>([]);
+  const [editingHapticProfile, setEditingHapticProfile] = useState<HapticProfile | null>(null);
+  const [linkTriggerEditing, setLinkTriggerEditing] = useState(false);
+  const [adaptiveTriggers, setAdaptiveTriggers] = useState<AdaptiveTriggerSettings>(defaultAdaptiveTriggerSettings());
+  const [gameTelemetryStatus, setGameTelemetryStatus] = useState<GameTelemetryStatus>(EMPTY_GAME_TELEMETRY_STATUS);
   const [touchpadEnabled, setTouchpadEnabled] = useState(false);
   const [touchpadSensitivity, setTouchpadSensitivity] = useState(1.0);
   const [launchOnStartup, setLaunchOnStartup] = useState(false);
   const [startupOpenMode, setStartupOpenMode] = useState<StartupOpenMode>("normal");
   const [closeToTray, setCloseToTray] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
+  const [ocrCalibrationPreview, setOcrCalibrationPreview] = useState<OcrCalibrationPreviewPayload | null>(null);
+  const [ocrCalibrationDraft, setOcrCalibrationDraft] = useState<OcrCalibrationDraft | null>(null);
+  const [ocrCalibrationLoading, setOcrCalibrationLoading] = useState(false);
+  const [ocrCalibrationDragging, setOcrCalibrationDragging] = useState(false);
+  const [ocrProcessOptions, setOcrProcessOptions] = useState<ActiveProcessOption[]>([]);
+  const [ocrProcessOptionsLoading, setOcrProcessOptionsLoading] = useState(false);
 
-  const [hapticProfiles, setHapticProfiles] = useState<HapticProfile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
-  const [editingProfile, setEditingProfile] = useState<HapticProfile | null>(null);
   const [mappingPresets, setMappingPresets] = useState<MappingProfile[]>([]);
   const [customMappingProfiles, setCustomMappingProfiles] = useState<MappingProfile[]>([]);
   const [mappingProfile, setMappingProfile] = useState<MappingProfile | null>(null);
@@ -158,15 +205,28 @@ function App() {
   const [calibrationCapabilities, setCalibrationCapabilities] = useState<CalibrationCapabilities | null>(null);
   const [firmwareStatus, setFirmwareStatus] = useState<FirmwareCalibrationStatus>(EMPTY_FIRMWARE_STATUS);
   const [firmwareRiskAccepted, setFirmwareRiskAccepted] = useState(false);
+  const [audioSettings, setAudioSettings] = useState<AudioSettings>({ ...DEFAULT_AUDIO });
+  const [speakerTestActive, setSpeakerTestActive] = useState(false);
+  const [speakerTestError, setSpeakerTestError] = useState<string | null>(null);
+  const [micTestActive, setMicTestActive] = useState(false);
+  const [micTestError, setMicTestError] = useState<string | null>(null);
 
   const pendingLightbarRef = useRef<{ r: number; g: number; b: number } | null>(null);
-  const pendingTriggersRef = useRef<{ lt: TriggerConfig; rt: TriggerConfig } | null>(null);
+  const pendingTriggersRef = useRef<{ lt: TriggerEffect; rt: TriggerEffect } | null>(null);
+  const pendingAudioRef = useRef<AudioSettings | null>(null);
   const rafIdRef = useRef(0);
   const autosaveTimeoutRef = useRef<number | null>(null);
   const hasLoadedPersistenceRef = useRef(false);
   const toastTimeoutRef = useRef<number | null>(null);
+  const lightingAnimationRef = useRef<number | null>(null);
+  const ocrPreviewImageRef = useRef<HTMLImageElement | null>(null);
+  const ocrDragOriginRef = useRef<{ x: number; y: number } | null>(null);
+  const startupSplashStartedAtRef = useRef(0);
+  const startupSplashExitTimeoutRef = useRef<number | null>(null);
+  const startupSplashHideTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
+    startupSplashStartedAtRef.current = performance.now();
     void initializeApp();
 
     const statusUnlisten = listen<boolean>("controller-status", (event) => {
@@ -178,20 +238,64 @@ function App() {
     const firmwareUnlisten = listen<FirmwareCalibrationStatus>("firmware-calibration-status", (event) => {
       setFirmwareStatus(event.payload);
     });
+    const telemetryUnlisten = listen<GameTelemetryStatus>("game-telemetry-status", (event) => {
+      setGameTelemetryStatus(event.payload);
+    });
 
     return () => {
       statusUnlisten.then(f => f());
       inputUnlisten.then(f => f());
       firmwareUnlisten.then(f => f());
+      telemetryUnlisten.then(f => f());
     };
   }, []);
 
   useEffect(() => {
+    if (!appInitialized) {
+      return;
+    }
+
+    const elapsedMs = performance.now() - startupSplashStartedAtRef.current;
+    const exitDelayMs = Math.max(0, 1450 - elapsedMs);
+
+    startupSplashExitTimeoutRef.current = window.setTimeout(() => {
+      setStartupSplashExiting(true);
+    }, exitDelayMs);
+
+    startupSplashHideTimeoutRef.current = window.setTimeout(() => {
+      setShowStartupSplash(false);
+    }, exitDelayMs + 650);
+
+    return () => {
+      if (startupSplashExitTimeoutRef.current) {
+        window.clearTimeout(startupSplashExitTimeoutRef.current);
+        startupSplashExitTimeoutRef.current = null;
+      }
+      if (startupSplashHideTimeoutRef.current) {
+        window.clearTimeout(startupSplashHideTimeoutRef.current);
+        startupSplashHideTimeoutRef.current = null;
+      }
+    };
+  }, [appInitialized]);
+
+  useEffect(() => {
     return () => {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+      if (lightingAnimationRef.current) {
+        window.clearInterval(lightingAnimationRef.current);
+        lightingAnimationRef.current = null;
+      }
       if (toastTimeoutRef.current) {
         window.clearTimeout(toastTimeoutRef.current);
         toastTimeoutRef.current = null;
+      }
+      if (startupSplashExitTimeoutRef.current) {
+        window.clearTimeout(startupSplashExitTimeoutRef.current);
+        startupSplashExitTimeoutRef.current = null;
+      }
+      if (startupSplashHideTimeoutRef.current) {
+        window.clearTimeout(startupSplashHideTimeoutRef.current);
+        startupSplashHideTimeoutRef.current = null;
       }
     };
   }, []);
@@ -218,16 +322,19 @@ function App() {
     };
   }, [
     activeMappingProfileId,
+    activeLightingProfileId,
     activeProfileId,
     activeTab,
+    adaptiveTriggers,
+    audioSettings,
     calibrationProfile,
     closeToTray,
     firmwareRiskAccepted,
     launchOnStartup,
     leftTrigger,
     lightingEnabled,
+    lightingDraft,
     mappingProfile,
-    rgb,
     rightTrigger,
     startupOpenMode,
     touchpadEnabled,
@@ -242,9 +349,55 @@ function App() {
     void syncRuntimeSettings(closeToTray, startupOpenMode);
   }, [closeToTray, startupOpenMode]);
 
+  useEffect(() => {
+    const previewColor = computeLightingColor(lightingDraft);
+    setLightingPreviewRgb(previewColor);
+
+    if (lightingAnimationRef.current) {
+      window.clearInterval(lightingAnimationRef.current);
+      lightingAnimationRef.current = null;
+    }
+
+    if (!hasLoadedPersistenceRef.current) {
+      return;
+    }
+
+    if (!lightingEnabled) {
+      pendingLightbarRef.current = { r: 0, g: 0, b: 0 };
+      scheduleIpcFlush();
+      return;
+    }
+
+    pendingLightbarRef.current = previewColor;
+    scheduleIpcFlush();
+
+    if (lightingDraft.effect === "static") {
+      return;
+    }
+
+    const intervalMs = Math.max(45, 180 - clampPercent(lightingDraft.speed));
+    lightingAnimationRef.current = window.setInterval(() => {
+      const nextColor = computeLightingColor(lightingDraft);
+      setLightingPreviewRgb(nextColor);
+      pendingLightbarRef.current = nextColor;
+      scheduleIpcFlush();
+    }, intervalMs);
+
+    return () => {
+      if (lightingAnimationRef.current) {
+        window.clearInterval(lightingAnimationRef.current);
+        lightingAnimationRef.current = null;
+      }
+    };
+  }, [
+    lightingEnabled,
+    lightingDraft,
+    isConnected,
+  ]);
+
   const initializeApp = async () => {
     try {
-      const [presets, backendProfile, backendCalibration, liveSnapshot, capabilities, fwStatus, status] = await Promise.all([
+      const [presets, backendProfile, backendCalibration, liveSnapshot, capabilities, fwStatus, status, telemetryStatus] = await Promise.all([
         invoke<MappingProfile[]>("get_mapping_presets"),
         invoke<MappingProfile>("get_mapping_profile"),
         invoke<CalibrationProfile>("get_calibration_profile"),
@@ -252,6 +405,7 @@ function App() {
         invoke<CalibrationCapabilities>("get_calibration_capabilities"),
         invoke<FirmwareCalibrationStatus>("get_firmware_calibration_status"),
         invoke<boolean>("get_controller_status"),
+        invoke<GameTelemetryStatus>("get_game_telemetry_status"),
       ]);
 
       setMappingPresets(presets);
@@ -259,13 +413,22 @@ function App() {
       setLiveInput(liveSnapshot);
       setFirmwareStatus(fwStatus);
       setIsConnected(status);
+      setGameTelemetryStatus(telemetryStatus);
 
-      const [loadedHaptics, loadedCustomMappings] = await Promise.all([
+      const [loadedHaptics, loadedCustomMappings, loadedLightingProfiles] = await Promise.all([
         loadHapticProfiles(),
         loadMappingProfiles(),
+        loadLightingProfiles(),
       ]);
 
-      await loadAppState(backendProfile, backendCalibration, presets, loadedCustomMappings, loadedHaptics);
+      await loadAppState(
+        backendProfile,
+        backendCalibration,
+        presets,
+        loadedCustomMappings,
+        loadedHaptics,
+        loadedLightingProfiles,
+      );
       try {
         setLaunchOnStartup(await isAutostartEnabled());
       } catch (error) {
@@ -274,6 +437,8 @@ function App() {
       hasLoadedPersistenceRef.current = true;
     } catch (e) {
       console.error("Failed to initialize app state:", e);
+    } finally {
+      setAppInitialized(true);
     }
   };
 
@@ -287,10 +452,15 @@ function App() {
     const tg = pendingTriggersRef.current;
     if (tg) {
       invoke("set_triggers", {
-        leftMode: clampU8(tg.lt.mode), leftForce: clampU8(tg.lt.force), leftStart: clampU8(tg.lt.startPos), leftEnd: clampU8(tg.lt.endPos), leftFrequency: clampU8(tg.lt.frequency),
-        rightMode: clampU8(tg.rt.mode), rightForce: clampU8(tg.rt.force), rightStart: clampU8(tg.rt.startPos), rightEnd: clampU8(tg.rt.endPos), rightFrequency: clampU8(tg.rt.frequency),
+        left: normalizeTriggerEffect(tg.lt),
+        right: normalizeTriggerEffect(tg.rt),
       }).catch(console.error);
       pendingTriggersRef.current = null;
+    }
+    const au = pendingAudioRef.current;
+    if (au) {
+      invoke("set_audio", { ...au }).catch(console.error);
+      pendingAudioRef.current = null;
     }
   };
 
@@ -300,42 +470,38 @@ function App() {
     }
   };
 
-  const sendTriggers = (lt: TriggerConfig, rt: TriggerConfig) => {
+  const sendTriggers = (lt: TriggerEffect, rt: TriggerEffect) => {
     invoke("set_triggers", {
-      leftMode: clampU8(lt.mode), leftForce: clampU8(lt.force), leftStart: clampU8(lt.startPos), leftEnd: clampU8(lt.endPos), leftFrequency: clampU8(lt.frequency),
-      rightMode: clampU8(rt.mode), rightForce: clampU8(rt.force), rightStart: clampU8(rt.startPos), rightEnd: clampU8(rt.endPos), rightFrequency: clampU8(rt.frequency),
+      left: normalizeTriggerEffect(lt),
+      right: normalizeTriggerEffect(rt),
     }).catch(console.error);
   };
 
-  const readJsonFile = async <T,>(fileName: string, baseDir: BaseDirectory): Promise<T | null> => {
-    try {
-      const contents = await readTextFile(fileName, { baseDir });
-      return JSON.parse(contents) as T;
-    } catch {
-      return null;
-    }
-  };
+  useEffect(() => {
+    const preview = computeAdaptiveTriggerPreview(adaptiveTriggers);
+    const usingLiveTelemetry =
+      adaptiveTriggers.enabled
+      && adaptiveTriggers.inputSource === "live"
+      && gameTelemetryStatus.stage === "attached"
+      && gameTelemetryStatus.speedKph !== null;
 
-  const writeJsonFile = async (fileName: string, value: unknown, baseDir: BaseDirectory = BaseDirectory.AppData) => {
-    await writeTextFile(fileName, JSON.stringify(value, null, 2), { baseDir });
-  };
+    invoke("sync_adaptive_trigger_settings", {
+      settings: normalizeAdaptiveTriggerSettings(adaptiveTriggers),
+    }).catch(console.error);
 
-  const loadPersistedJson = async <T,>(fileName: string, legacyFileName: string = fileName): Promise<T | null> => {
-    const appDataValue = await readJsonFile<T>(fileName, BaseDirectory.AppData);
-    if (appDataValue !== null) {
-      return appDataValue;
+    if (!adaptiveTriggers.enabled) {
+      invoke("clear_adaptive_triggers").catch(console.error);
+      return;
     }
 
-    const legacyValue = await readJsonFile<T>(legacyFileName, BaseDirectory.AppConfig);
-    if (legacyValue !== null) {
-      try {
-        await writeJsonFile(fileName, legacyValue);
-      } catch (error) {
-        console.error(`Failed to migrate ${legacyFileName} to AppData:`, error);
-      }
+    if (!usingLiveTelemetry) {
+      invoke("set_adaptive_triggers", {
+        left: normalizeTriggerEffect(preview.left),
+        right: normalizeTriggerEffect(preview.right),
+      }).catch(console.error);
+      return;
     }
-    return legacyValue;
-  };
+  }, [adaptiveTriggers, gameTelemetryStatus.speedKph, gameTelemetryStatus.stage]);
 
   const showToast = (nextToast: ToastState) => {
     if (toastTimeoutRef.current) {
@@ -364,7 +530,11 @@ function App() {
     activeTab,
     firmwareRiskAccepted,
     lightingEnabled,
-    rgb,
+    lighting: {
+      enabled: lightingEnabled,
+      profileId: activeLightingProfileId,
+      profile: cloneLightingProfile(lightingDraft),
+    },
     leftTrigger,
     rightTrigger,
     activeProfileId,
@@ -376,11 +546,17 @@ function App() {
     launchOnStartup,
     startupOpenMode,
     closeToTray,
+    audioSettings,
+    adaptiveTriggers: cloneAdaptiveTriggerSettings(adaptiveTriggers),
   });
 
   const saveAppState = async (notify = false) => {
     try {
-      await writeJsonFile(APP_STATE_FILE, buildPersistedAppState());
+      await writeJsonFile(APP_STATE_FILE, {
+        ...buildPersistedAppState(),
+        schemaVersion: APP_STATE_SCHEMA_VERSION,
+        runtimeSettings: createRuntimeSettingsSnapshot(launchOnStartup, startupOpenMode, closeToTray),
+      });
       if (notify) {
         showToast({
           title: "Profile saved",
@@ -399,25 +575,31 @@ function App() {
   };
 
   const loadHapticProfiles = async () => {
-    const parsed = await loadPersistedJson<HapticProfile[]>(HAPTIC_PROFILES_FILE);
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      setHapticProfiles(parsed);
-      return parsed;
+    const parsed = await loadPersistedJson<HapticProfile[]>(TRIGGER_PROFILES_FILE, HAPTIC_PROFILES_FILE);
+    if (Array.isArray(parsed)) {
+      const customOnly = parsed
+        .filter((profile) => !profile.builtIn)
+        .map((profile) => ({
+          ...cloneHapticProfile(profile),
+          description: profile.description ?? "",
+          category: profile.category ?? "Custom",
+          left: migrateLegacyTriggerEffect(profile.left as TriggerEffect),
+          right: migrateLegacyTriggerEffect(profile.right as TriggerEffect),
+        }));
+      setCustomHapticProfiles(customOnly);
+      return customOnly;
     }
 
-    const seededProfiles = [...BUILTIN_PROFILES];
-    setHapticProfiles(seededProfiles);
-    try {
-      await saveHapticProfilesList(seededProfiles);
-    } catch (error) {
-      console.error("Failed to seed haptic profiles:", error);
-    }
-    return seededProfiles;
+    setCustomHapticProfiles([]);
+    return [] as HapticProfile[];
   };
 
   const saveHapticProfilesList = async (profiles: HapticProfile[]) => {
     try {
-      await writeJsonFile(HAPTIC_PROFILES_FILE, profiles);
+      await writeJsonFile(
+        TRIGGER_PROFILES_FILE,
+        profiles.map((profile) => ({ ...cloneHapticProfile(profile), builtIn: false })),
+      );
     } catch (e) {
       console.error("Failed to save haptic profiles:", e);
     }
@@ -426,7 +608,9 @@ function App() {
   const loadMappingProfiles = async () => {
     const parsed = await loadPersistedJson<MappingProfile[]>(MAPPING_PROFILES_FILE);
     if (Array.isArray(parsed)) {
-      const customOnly = parsed.filter((profile) => !profile.builtIn);
+      const customOnly = parsed
+        .map((profile) => normalizeMappingProfile(profile))
+        .filter((profile) => !profile.builtIn);
       setCustomMappingProfiles(customOnly);
       return customOnly;
     }
@@ -437,14 +621,43 @@ function App() {
 
   const saveMappingProfilesList = async (profiles: MappingProfile[]) => {
     try {
-      await writeJsonFile(MAPPING_PROFILES_FILE, profiles);
+      await writeJsonFile(
+        MAPPING_PROFILES_FILE,
+        profiles.map((profile) => ({
+          ...normalizeMappingProfile(profile),
+          builtIn: false,
+        })),
+      );
     } catch (e) {
       console.error("Failed to save mapping profiles:", e);
     }
   };
 
+  const loadLightingProfiles = async () => {
+    const parsed = await loadPersistedJson<LightingProfile[]>(LIGHTING_PROFILES_FILE);
+    if (Array.isArray(parsed)) {
+      const customOnly = parsed.filter((profile) => !profile.builtIn).map(cloneLightingProfile);
+      setCustomLightingProfiles(customOnly);
+      return customOnly;
+    }
+
+    setCustomLightingProfiles([]);
+    return [] as LightingProfile[];
+  };
+
+  const saveLightingProfilesList = async (profiles: LightingProfile[]) => {
+    try {
+      await writeJsonFile(
+        LIGHTING_PROFILES_FILE,
+        profiles.map((profile) => ({ ...cloneLightingProfile(profile), builtIn: false })),
+      );
+    } catch (e) {
+      console.error("Failed to save lighting profiles:", e);
+    }
+  };
+
   const commitMappingProfile = (profile: MappingProfile, profileId: string | null = null) => {
-    const next = cloneMappingProfile(profile);
+    const next = normalizeMappingProfile(cloneMappingProfile(profile));
     setMappingProfile(next);
     setActiveMappingProfileId(profileId);
     invoke("set_mapping_profile", { profile: next }).catch(console.error);
@@ -462,47 +675,90 @@ function App() {
     builtInMappingPresets: MappingProfile[],
     loadedCustomMappings: MappingProfile[],
     loadedHaptics: HapticProfile[],
+    loadedLightingProfiles: LightingProfile[],
   ) => {
-    const data = await loadPersistedJson<PersistedAppState>(APP_STATE_FILE, LEGACY_PROFILE_FILE);
-    const resolvedState = data ?? {};
-    const nextStartupOpenMode: StartupOpenMode = resolvedState.startupOpenMode === "tray" ? "tray" : "normal";
-    const nextCloseToTray = Boolean(resolvedState.closeToTray);
-    const nextLaunchOnStartup = Boolean(resolvedState.launchOnStartup);
+    const data = await loadVersionedAppState(APP_STATE_FILE, LEGACY_PROFILE_FILE);
+    const resolvedState: PersistedAppState = data ?? {};
+    const nextStartupOpenMode = normalizeStartupOpenMode(
+      data?.runtimeSettings?.startupOpenMode ?? resolvedState.startupOpenMode,
+    );
+    const nextCloseToTray = Boolean(data?.runtimeSettings?.closeToTray ?? resolvedState.closeToTray);
+    const nextLaunchOnStartup = Boolean(data?.runtimeSettings?.launchOnStartup ?? resolvedState.launchOnStartup);
+    const lightingProfiles = [...BUILTIN_LIGHTING_PROFILES, ...loadedLightingProfiles];
+    const legacyLightingProfileId = (
+      resolvedState.lighting as (Partial<LightingSettings> & { presetId?: string }) | undefined
+    )?.presetId ?? null;
+    const legacyLightingProfile: LightingProfile = {
+      id: "legacy-manual",
+      name: "Manual Lighting",
+      description: "Recovered from an older saved lighting configuration.",
+      builtIn: false,
+      effect: "static",
+      color: {
+        ...DEFAULT_LIGHTING.profile.color,
+        ...(resolvedState.lighting?.profile?.color ?? resolvedState.rgb ?? {}),
+      },
+      accentColor: cloneLightingColor(resolvedState.lighting?.profile?.accentColor) ?? {
+        ...DEFAULT_LIGHTING.profile.color,
+        ...(resolvedState.lighting?.profile?.color ?? resolvedState.rgb ?? {}),
+      },
+      speed: clampPercent(
+        resolvedState.lighting?.profile?.speed ?? DEFAULT_LIGHTING.profile.speed,
+      ),
+      brightness: clampPercent(
+        resolvedState.lighting?.profile?.brightness ?? DEFAULT_LIGHTING.profile.brightness,
+      ),
+    };
+    const persistedLighting = resolvedState.lighting;
+    const matchedLightingProfile = getLightingProfile(
+      lightingProfiles,
+      persistedLighting?.profileId ?? legacyLightingProfileId,
+    );
+    const nextLightingProfile = persistedLighting?.profile
+      ? cloneLightingProfile({ ...persistedLighting.profile, builtIn: Boolean(persistedLighting.profile.builtIn) })
+      : matchedLightingProfile
+        ? cloneLightingProfile(matchedLightingProfile)
+        : cloneLightingProfile(legacyLightingProfile);
+    const nextLighting: LightingSettings = {
+      enabled: persistedLighting?.enabled ?? resolvedState.lightingEnabled ?? DEFAULT_LIGHTING.enabled,
+      profileId: matchedLightingProfile?.id ?? null,
+      profile: {
+        ...nextLightingProfile,
+        speed: clampPercent(nextLightingProfile.speed),
+        brightness: clampPercent(nextLightingProfile.brightness),
+        accentColor: usesAccentColor(nextLightingProfile.effect)
+          ? cloneLightingColor(nextLightingProfile.accentColor) ?? { ...nextLightingProfile.color }
+          : null,
+      },
+    };
 
     if (resolvedState.activeTab) {
-      setActiveTab(resolvedState.activeTab);
+      setActiveTab(resolvedState.activeTab === "triggers" ? "haptics" : resolvedState.activeTab);
     }
 
     if (resolvedState.firmwareRiskAccepted !== undefined) {
       setFirmwareRiskAccepted(Boolean(resolvedState.firmwareRiskAccepted));
     }
 
-    if (resolvedState.rgb && typeof resolvedState.rgb === "object") {
-      const { r, g, b } = resolvedState.rgb;
-      setRgb({ r, g, b });
-      if (resolvedState.lightingEnabled !== false) {
-        invoke("set_lightbar", { r, g, b }).catch(console.error);
-      }
-    }
-    if (resolvedState.lightingEnabled !== undefined) {
-      setLightingEnabled(Boolean(resolvedState.lightingEnabled));
-    }
-    const lt: TriggerConfig = resolvedState.leftTrigger
-      ? { ...DEFAULT_TRIGGER, ...resolvedState.leftTrigger }
-      : { ...DEFAULT_TRIGGER };
-    const rt: TriggerConfig = resolvedState.rightTrigger
-      ? { ...DEFAULT_TRIGGER, ...resolvedState.rightTrigger }
-      : { ...DEFAULT_TRIGGER };
+    setLightingEnabled(nextLighting.enabled);
+    setActiveLightingProfileId(nextLighting.profileId);
+    setLightingDraft(cloneLightingProfile(nextLighting.profile));
+    const initialLightingColor = computeLightingColor(nextLighting.profile);
+    setLightingPreviewRgb(initialLightingColor);
+    const nextLightbarColor = nextLighting.enabled ? initialLightingColor : { r: 0, g: 0, b: 0 };
+    invoke("set_lightbar", { ...nextLightbarColor }).catch(console.error);
+    const lt = migrateLegacyTriggerEffect(resolvedState.leftTrigger as TriggerEffect | undefined);
+    const rt = migrateLegacyTriggerEffect(resolvedState.rightTrigger as TriggerEffect | undefined);
     setLeftTrigger(lt);
     setRightTrigger(rt);
     sendTriggers(lt, rt);
 
     if (resolvedState.activeProfileId !== undefined) {
       setActiveProfileId(resolvedState.activeProfileId ?? null);
-      const selectedHaptic = loadedHaptics.find((profile) => profile.id === resolvedState.activeProfileId);
+      const selectedHaptic = [...BUILTIN_HAPTIC_PROFILES, ...loadedHaptics].find((profile) => profile.id === resolvedState.activeProfileId);
       if (selectedHaptic) {
-        setLeftTrigger({ ...selectedHaptic.left });
-        setRightTrigger({ ...selectedHaptic.right });
+        setLeftTrigger(cloneTriggerEffect(selectedHaptic.left));
+        setRightTrigger(cloneTriggerEffect(selectedHaptic.right));
         sendTriggers(selectedHaptic.left, selectedHaptic.right);
       }
     }
@@ -517,6 +773,14 @@ function App() {
       invoke("set_touchpad_sensitivity", { sensitivity: resolvedState.touchpadSensitivity }).catch(console.error);
     }
 
+    if (resolvedState.audioSettings && typeof resolvedState.audioSettings === "object") {
+      const audio: AudioSettings = { ...DEFAULT_AUDIO, ...resolvedState.audioSettings };
+      setAudioSettings(audio);
+      invoke("set_audio", { ...audio }).catch(console.error);
+    }
+
+    setAdaptiveTriggers(normalizeAdaptiveTriggerSettings(resolvedState.adaptiveTriggers));
+
     setLaunchOnStartup(nextLaunchOnStartup);
     setStartupOpenMode(nextStartupOpenMode);
     setCloseToTray(nextCloseToTray);
@@ -527,12 +791,12 @@ function App() {
       if (activeProfile) {
         commitMappingProfile(activeProfile, activeProfile.id);
       } else if (resolvedState.manualMappingProfile) {
-        commitMappingProfile(toManualProfile(resolvedState.manualMappingProfile), null);
+        commitMappingProfile(toManualProfile(normalizeMappingProfile(resolvedState.manualMappingProfile)), null);
       } else {
         commitMappingProfile(defaultMappingProfile, defaultMappingProfile.builtIn ? defaultMappingProfile.id : null);
       }
     } else if (resolvedState.manualMappingProfile && typeof resolvedState.manualMappingProfile === "object") {
-      commitMappingProfile(toManualProfile(resolvedState.manualMappingProfile), null);
+      commitMappingProfile(toManualProfile(normalizeMappingProfile(resolvedState.manualMappingProfile)), null);
     } else {
       commitMappingProfile(defaultMappingProfile, defaultMappingProfile.builtIn ? defaultMappingProfile.id : null);
     }
@@ -553,6 +817,177 @@ function App() {
     }
     await saveAppState(true);
   };
+
+  const updateAdaptiveTriggerSettings = (
+    updater: (current: AdaptiveTriggerSettings) => AdaptiveTriggerSettings,
+  ) => {
+    setAdaptiveTriggers((current) => normalizeAdaptiveTriggerSettings(updater(cloneAdaptiveTriggerSettings(current))));
+  };
+
+  const updateNfsHeatAdaptiveSettings = (
+    patch: Partial<AdaptiveTriggerSettings["nfsHeat"]>,
+  ) => {
+    updateAdaptiveTriggerSettings((current) => ({
+      ...current,
+      nfsHeat: {
+        ...current.nfsHeat,
+        ...patch,
+      },
+    }));
+  };
+
+  const closeOcrCalibrationModal = () => {
+    setOcrCalibrationDragging(false);
+    setOcrCalibrationPreview(null);
+    setOcrCalibrationDraft(null);
+    ocrDragOriginRef.current = null;
+  };
+
+  const loadOcrCalibrationPreview = async () => {
+    setOcrCalibrationLoading(true);
+    try {
+      const preview = await invoke<OcrCalibrationPreviewPayload>("capture_live_ocr_calibration_preview", {
+        settings: normalizeAdaptiveTriggerSettings(adaptiveTriggers),
+      });
+      setOcrCalibrationPreview(preview);
+      setOcrCalibrationDraft(adaptiveTriggers.nfsHeat.ocrCalibration
+        ? {
+            originX: adaptiveTriggers.nfsHeat.ocrCalibration.x,
+            originY: adaptiveTriggers.nfsHeat.ocrCalibration.y,
+            width: adaptiveTriggers.nfsHeat.ocrCalibration.width,
+            height: adaptiveTriggers.nfsHeat.ocrCalibration.height,
+          }
+        : null);
+    } catch (error) {
+      console.error("Failed to capture OCR calibration preview:", error);
+      showToast({
+        title: "Calibration capture failed",
+        message: error instanceof Error ? error.message : "WinSense could not capture the selected OCR target window.",
+        tone: "error",
+      });
+    } finally {
+      setOcrCalibrationLoading(false);
+    }
+  };
+
+  const loadOcrProcessOptions = async () => {
+    setOcrProcessOptionsLoading(true);
+    try {
+      const options = await invoke<ActiveProcessOption[]>("list_live_ocr_process_options");
+      setOcrProcessOptions(options);
+    } catch (error) {
+      console.error("Failed to list OCR process options:", error);
+      setOcrProcessOptions([]);
+    } finally {
+      setOcrProcessOptionsLoading(false);
+    }
+  };
+
+  const resetOcrCalibration = () => {
+    updateNfsHeatAdaptiveSettings({ ocrCalibration: null });
+    showToast({
+      title: "OCR calibration cleared",
+      message: "WinSense will wait for a new speedometer region before reading live speed again.",
+      tone: "success",
+    });
+  };
+
+  const saveOcrCalibration = () => {
+    if (!ocrCalibrationPreview || !ocrCalibrationDraft || ocrCalibrationDraft.width < 8 || ocrCalibrationDraft.height < 8) {
+      showToast({
+        title: "Selection too small",
+        message: "Draw a rectangle around the speed digits before saving the OCR calibration.",
+        tone: "error",
+      });
+      return;
+    }
+
+    const region: OcrCalibrationRegion = {
+      x: ocrCalibrationDraft.originX,
+      y: ocrCalibrationDraft.originY,
+      width: ocrCalibrationDraft.width,
+      height: ocrCalibrationDraft.height,
+      referenceWidth: ocrCalibrationPreview.width,
+      referenceHeight: ocrCalibrationPreview.height,
+    };
+    updateNfsHeatAdaptiveSettings({ ocrCalibration: region });
+    closeOcrCalibrationModal();
+    showToast({
+      title: "OCR calibration saved",
+      message: "WinSense will use the selected speedometer region for live OCR reads.",
+      tone: "success",
+    });
+  };
+
+  const getPreviewRelativePoint = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!ocrCalibrationPreview || !ocrPreviewImageRef.current) {
+      return null;
+    }
+
+    const bounds = ocrPreviewImageRef.current.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) {
+      return null;
+    }
+
+    const scaleX = ocrCalibrationPreview.width / bounds.width;
+    const scaleY = ocrCalibrationPreview.height / bounds.height;
+    const x = Math.max(0, Math.min(ocrCalibrationPreview.width, Math.round((event.clientX - bounds.left) * scaleX)));
+    const y = Math.max(0, Math.min(ocrCalibrationPreview.height, Math.round((event.clientY - bounds.top) * scaleY)));
+    return { x, y };
+  };
+
+  const beginOcrCalibrationDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const point = getPreviewRelativePoint(event);
+    if (!point) {
+      return;
+    }
+
+    ocrDragOriginRef.current = point;
+    setOcrCalibrationDragging(true);
+    setOcrCalibrationDraft({
+      originX: point.x,
+      originY: point.y,
+      width: 1,
+      height: 1,
+    });
+  };
+
+  const updateOcrCalibrationDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!ocrCalibrationDragging || !ocrCalibrationPreview || !ocrDragOriginRef.current) {
+      return;
+    }
+
+    const point = getPreviewRelativePoint(event);
+    if (!point) {
+      return;
+    }
+
+    const start = ocrDragOriginRef.current;
+    const originX = Math.max(0, Math.min(start.x, point.x));
+    const originY = Math.max(0, Math.min(start.y, point.y));
+    const width = Math.max(1, Math.abs(point.x - start.x));
+    const height = Math.max(1, Math.abs(point.y - start.y));
+
+    setOcrCalibrationDraft({
+      originX,
+      originY,
+      width: Math.min(width, ocrCalibrationPreview.width - originX),
+      height: Math.min(height, ocrCalibrationPreview.height - originY),
+    });
+  };
+
+  const finishOcrCalibrationDrag = () => {
+    setOcrCalibrationDragging(false);
+    ocrDragOriginRef.current = null;
+  };
+
+  useEffect(() => {
+    if (activeTab !== "adaptiveTriggers" || adaptiveTriggers.inputSource !== "live") {
+      return;
+    }
+
+    void loadOcrProcessOptions();
+  }, [activeTab, adaptiveTriggers.inputSource]);
 
   const toggleLaunchOnStartup = async () => {
     const nextValue = !launchOnStartup;
@@ -594,69 +1029,323 @@ function App() {
     });
   };
 
-  const handleColorChange = (color: string, value: number) => {
-    const newRgb = { ...rgb, [color]: value };
-    setRgb(newRgb);
-    if (lightingEnabled) {
-      pendingLightbarRef.current = { r: newRgb.r, g: newRgb.g, b: newRgb.b };
-      scheduleIpcFlush();
-    }
+  const persistCustomLightingProfiles = (profiles: LightingProfile[]) => {
+    const normalized = profiles.map((profile) => ({ ...cloneLightingProfile(profile), builtIn: false }));
+    setCustomLightingProfiles(normalized);
+    void saveLightingProfilesList(normalized);
   };
 
-  const toggleLighting = async () => {
-    const newState = !lightingEnabled;
-    setLightingEnabled(newState);
-    try {
-      if (newState) {
-        await invoke("set_lightbar", { r: rgb.r, g: rgb.g, b: rgb.b });
-      } else {
-        await invoke("set_lightbar", { r: 0, g: 0, b: 0 });
+  const commitLightingProfile = (profile: LightingProfile, profileId: string | null = null) => {
+    setLightingDraft(cloneLightingProfile(profile));
+    setActiveLightingProfileId(profileId);
+  };
+
+  const updateLightingDraft = (updater: (profile: LightingProfile) => LightingProfile) => {
+    setLightingDraft((current) => {
+      const next = cloneLightingProfile(updater(cloneLightingProfile(current)));
+      if (!usesAccentColor(next.effect)) {
+        next.accentColor = null;
+      } else if (!next.accentColor) {
+        next.accentColor = { ...next.color };
       }
-    } catch (e) {
-      console.error(e);
+      next.speed = clampPercent(next.speed);
+      next.brightness = clampPercent(next.brightness);
+      return next;
+    });
+    setActiveLightingProfileId(null);
+  };
+
+  const handleColorChange = (color: keyof LightingColor, value: number) => {
+    updateLightingDraft((profile) => ({
+      ...profile,
+      color: { ...profile.color, [color]: value },
+      accentColor: usesAccentColor(profile.effect)
+        ? profile.accentColor ?? { ...profile.color, [color]: value }
+        : null,
+    }));
+  };
+
+  const handleAccentColorChange = (color: keyof LightingColor, value: number) => {
+    updateLightingDraft((profile) => ({
+      ...profile,
+      accentColor: {
+        ...(profile.accentColor ?? profile.color),
+        [color]: value,
+      },
+    }));
+  };
+
+  const handleLightingEffectChange = (effect: LightingEffect) => {
+    updateLightingDraft((profile) => ({
+      ...profile,
+      effect,
+      accentColor: usesAccentColor(effect)
+        ? cloneLightingColor(profile.accentColor) ?? { ...profile.color }
+        : null,
+    }));
+  };
+
+  const applyLightingProfile = (profile: LightingProfile) => {
+    commitLightingProfile(profile, profile.id);
+  };
+
+  const startNewLightingProfile = () => {
+    setActiveLightingProfileId(null);
+    setLightingDraft(createCustomLightingProfileDraft());
+  };
+
+  const saveLightingProfile = () => {
+    const trimmedName = lightingDraft.name.trim();
+    if (!trimmedName) {
+      return;
+    }
+
+    const shouldCreateNewProfile = lightingDraft.builtIn
+      || BUILTIN_LIGHTING_PROFILES.some((profile) => profile.id === lightingDraft.id);
+    const nextProfile: LightingProfile = {
+      ...cloneLightingProfile(lightingDraft),
+      id: shouldCreateNewProfile ? generateLightingProfileId() : lightingDraft.id,
+      name: trimmedName,
+      description: lightingDraft.description.trim(),
+      builtIn: false,
+    };
+    const exists = customLightingProfiles.some((profile) => profile.id === nextProfile.id);
+    const updatedProfiles = exists
+      ? customLightingProfiles.map((profile) => profile.id === nextProfile.id ? nextProfile : profile)
+      : [...customLightingProfiles, nextProfile];
+
+    persistCustomLightingProfiles(updatedProfiles);
+    commitLightingProfile(nextProfile, nextProfile.id);
+    showToast({
+      title: exists ? "Lighting profile updated" : "Lighting profile saved",
+      message: exists
+        ? `${nextProfile.name} was updated in your lighting library.`
+        : `${nextProfile.name} was added to your lighting library.`,
+      tone: "success",
+    });
+  };
+
+  const deleteLightingProfile = (profileId: string) => {
+    const profile = customLightingProfiles.find((item) => item.id === profileId);
+    const updatedProfiles = customLightingProfiles.filter((item) => item.id !== profileId);
+    persistCustomLightingProfiles(updatedProfiles);
+
+    if (activeLightingProfileId === profileId) {
+      const fallback = BUILTIN_LIGHTING_PROFILES[0];
+      commitLightingProfile(fallback, fallback.id);
+    }
+
+    if (lightingDraft.id === profileId) {
+      startNewLightingProfile();
+    }
+
+    showToast({
+      title: "Lighting profile deleted",
+      message: `${profile?.name ?? "Custom profile"} was removed from your lighting library.`,
+      tone: "success",
+    });
+  };
+
+  const toggleLighting = () => {
+    setLightingEnabled((current) => !current);
+  };
+
+  const handleAudioChange = <K extends keyof AudioSettings>(field: K, value: AudioSettings[K]) => {
+    const next = { ...audioSettings, [field]: value };
+    setAudioSettings(next);
+    pendingAudioRef.current = next;
+    if (!rafIdRef.current) {
+      rafIdRef.current = requestAnimationFrame(flushIpc);
     }
   };
 
-  const handleTriggerChange = (side: 'left' | 'right', field: keyof TriggerConfig, value: number) => {
-    setActiveProfileId(null);
-    let newLeft = leftTrigger;
-    let newRight = rightTrigger;
-    if (side === 'left') {
-      newLeft = { ...leftTrigger, [field]: value };
-      setLeftTrigger(newLeft);
-    } else {
-      newRight = { ...rightTrigger, [field]: value };
-      setRightTrigger(newRight);
+  const handleTestSpeaker = async () => {
+    if (speakerTestActive) return;
+    setSpeakerTestError(null);
+    setSpeakerTestActive(true);
+    try {
+      await invoke("test_speaker");
+    } catch (error) {
+      const message = typeof error === "string" ? error : "Speaker test failed to start.";
+      setSpeakerTestActive(false);
+      setSpeakerTestError(message);
+      showToast({
+        title: "Speaker test unavailable",
+        message,
+        tone: "error",
+      });
+      return;
     }
-    pendingTriggersRef.current = { lt: newLeft, rt: newRight };
+    const poll = setInterval(async () => {
+      try {
+        const [spk] = await invoke<[boolean, boolean]>("get_audio_test_status");
+        if (!spk) {
+          setSpeakerTestActive(false);
+          clearInterval(poll);
+        }
+      } catch {
+        setSpeakerTestActive(false);
+        clearInterval(poll);
+      }
+    }, 200);
+  };
+
+  const handleMicTest = async () => {
+    setMicTestError(null);
+    if (micTestActive) {
+      invoke("stop_mic_test").catch(console.error);
+      setMicTestActive(false);
+    } else {
+      try {
+        await invoke("start_mic_test");
+        setMicTestActive(true);
+      } catch (e: unknown) {
+        setMicTestError(typeof e === "string" ? e : "Failed to start mic test.");
+      }
+    }
+  };
+
+  const updateTriggerEffect = (
+    side: "left" | "right",
+    updater: (effect: TriggerEffect) => TriggerEffect,
+    options?: { preserveProfile?: boolean },
+  ) => {
+    const preserveProfile = options?.preserveProfile ?? false;
+    const nextLeft = side === "left" ? normalizeTriggerEffect(updater(cloneTriggerEffect(leftTrigger))) : cloneTriggerEffect(leftTrigger);
+    const nextRight = side === "right" ? normalizeTriggerEffect(updater(cloneTriggerEffect(rightTrigger))) : cloneTriggerEffect(rightTrigger);
+    const finalLeft = linkTriggerEditing && side === "left" ? cloneTriggerEffect(nextLeft) : nextLeft;
+    const finalRight = linkTriggerEditing && side === "left" ? cloneTriggerEffect(nextLeft) : nextRight;
+    const mirroredLeft = linkTriggerEditing && side === "right" ? cloneTriggerEffect(nextRight) : finalLeft;
+    const mirroredRight = linkTriggerEditing && side === "right" ? cloneTriggerEffect(nextRight) : finalRight;
+
+    if (!preserveProfile) {
+      setActiveProfileId(null);
+    }
+    setLeftTrigger(mirroredLeft);
+    setRightTrigger(mirroredRight);
+    pendingTriggersRef.current = { lt: mirroredLeft, rt: mirroredRight };
     scheduleIpcFlush();
   };
 
+  const applyTriggerEffectKind = (side: "left" | "right", kind: TriggerEffectKind) => {
+    updateTriggerEffect(side, (effect) => {
+      const next = cloneTriggerEffect(DEFAULT_TRIGGER_EFFECT);
+      next.kind = kind;
+      next.startPosition = effect.startPosition ?? next.startPosition;
+      next.endPosition = effect.endPosition ?? next.endPosition;
+      next.force = effect.force ?? next.force;
+      next.frequency = effect.frequency ?? next.frequency;
+      next.rawMode = kind === "raw" ? effect.rawMode ?? 0 : getTriggerEffectDefinition(kind).mode;
+      next.rawParams = effect.rawParams ? [...effect.rawParams] : [...(next.rawParams ?? [])];
+      return next;
+    });
+  };
+
+  const updateTriggerNumericField = (
+    side: "left" | "right",
+    field: "startPosition" | "endPosition" | "force" | "frequency" | "rawMode",
+    value: number,
+  ) => {
+    updateTriggerEffect(side, (effect) => ({ ...effect, [field]: value }));
+  };
+
+  const updateTriggerRawParam = (side: "left" | "right", index: number, value: number) => {
+    updateTriggerEffect(side, (effect) => {
+      const rawParams = [...(effect.rawParams ?? Array(10).fill(0))];
+      rawParams[index] = clampU8(value);
+      return { ...effect, rawParams };
+    });
+  };
+
+  const resetTriggerSide = (side: "left" | "right") => {
+    updateTriggerEffect(side, () => cloneTriggerEffect(DEFAULT_TRIGGER_EFFECT));
+  };
+
+  const copyTriggerSide = (from: "left" | "right", to: "left" | "right") => {
+    const source = from === "left" ? leftTrigger : rightTrigger;
+    const next = cloneTriggerEffect(source);
+    if (to === "left") {
+      setActiveProfileId(null);
+      setLeftTrigger(next);
+      pendingTriggersRef.current = { lt: next, rt: cloneTriggerEffect(rightTrigger) };
+    } else {
+      setActiveProfileId(null);
+      setRightTrigger(next);
+      pendingTriggersRef.current = { lt: cloneTriggerEffect(leftTrigger), rt: next };
+    }
+    scheduleIpcFlush();
+  };
+
+  const startNewHapticProfile = () => {
+    setEditingHapticProfile(createHapticProfileDraft(leftTrigger, rightTrigger));
+  };
+
+  const loadHapticProfileForEditing = (profile: HapticProfile) => {
+    setLeftTrigger(cloneTriggerEffect(profile.left));
+    setRightTrigger(cloneTriggerEffect(profile.right));
+    pendingTriggersRef.current = { lt: cloneTriggerEffect(profile.left), rt: cloneTriggerEffect(profile.right) };
+    scheduleIpcFlush();
+    setEditingHapticProfile(cloneHapticProfile({
+      ...profile,
+      builtIn: false,
+      id: profile.builtIn ? createHapticProfileDraft(profile.left, profile.right).id : profile.id,
+    }));
+    setActiveProfileId(profile.builtIn ? null : profile.id);
+  };
+
+  const persistCustomHapticProfiles = (profiles: HapticProfile[]) => {
+    const normalized = profiles.map((profile) => ({ ...cloneHapticProfile(profile), builtIn: false }));
+    setCustomHapticProfiles(normalized);
+    void saveHapticProfilesList(normalized);
+  };
+
+  const allHapticProfiles = [...BUILTIN_HAPTIC_PROFILES, ...customHapticProfiles];
+
   const applyHapticProfile = (profile: HapticProfile) => {
     setActiveProfileId(profile.id);
-    setLeftTrigger({ ...profile.left });
-    setRightTrigger({ ...profile.right });
+    setLeftTrigger(cloneTriggerEffect(profile.left));
+    setRightTrigger(cloneTriggerEffect(profile.right));
     sendTriggers(profile.left, profile.right);
   };
 
   const saveHapticProfile = (profile: HapticProfile) => {
-    const existing = hapticProfiles.findIndex(p => p.id === profile.id);
-    let updated: HapticProfile[];
-    if (existing >= 0) {
-      updated = hapticProfiles.map(p => p.id === profile.id ? profile : p);
-    } else {
-      updated = [...hapticProfiles, profile];
-    }
-    setHapticProfiles(updated);
-    saveHapticProfilesList(updated);
-    setEditingProfile(null);
+    const trimmedName = profile.name.trim();
+    if (!trimmedName) return;
+
+    const nextProfile: HapticProfile = {
+      ...cloneHapticProfile(profile),
+      name: trimmedName,
+      description: profile.description.trim(),
+      category: profile.category.trim() || "Custom",
+      builtIn: false,
+    };
+    const exists = customHapticProfiles.some((item) => item.id === nextProfile.id);
+    const updatedProfiles = exists
+      ? customHapticProfiles.map((item) => item.id === nextProfile.id ? nextProfile : item)
+      : [...customHapticProfiles, nextProfile];
+    persistCustomHapticProfiles(updatedProfiles);
+    setEditingHapticProfile(nextProfile);
+    setActiveProfileId(nextProfile.id);
+    showToast({
+      title: exists ? "Haptic profile updated" : "Haptic profile saved",
+      message: exists
+        ? `${nextProfile.name} was updated in your haptic library.`
+        : `${nextProfile.name} was added to your haptic library.`,
+      tone: "success",
+    });
   };
 
   const deleteHapticProfile = (id: string) => {
-    const updated = hapticProfiles.filter(p => p.id !== id);
-    setHapticProfiles(updated);
-    saveHapticProfilesList(updated);
+    const profile = customHapticProfiles.find((item) => item.id === id);
+    const updated = customHapticProfiles.filter((item) => item.id !== id);
+    persistCustomHapticProfiles(updated);
     if (activeProfileId === id) setActiveProfileId(null);
+    if (editingHapticProfile?.id === id) setEditingHapticProfile(null);
+    showToast({
+      title: "Haptic profile deleted",
+      message: `${profile?.name ?? "Custom profile"} was removed from your haptic library.`,
+      tone: "success",
+    });
   };
 
   const toggleTouchpad = async () => {
@@ -675,7 +1364,10 @@ function App() {
   };
 
   const persistCustomMappingProfiles = (profiles: MappingProfile[]) => {
-    const normalized = profiles.map((profile) => ({ ...cloneMappingProfile(profile), builtIn: false }));
+    const normalized = profiles.map((profile) => ({
+      ...normalizeMappingProfile(cloneMappingProfile(profile)),
+      builtIn: false,
+    }));
     setCustomMappingProfiles(normalized);
     void saveMappingProfilesList(normalized);
   };
@@ -711,7 +1403,7 @@ function App() {
   const createMappingProfileFromCurrent = () => {
     if (!mappingProfile) return;
     setEditingMappingProfile({
-      ...cloneMappingProfile(mappingProfile),
+      ...normalizeMappingProfile(cloneMappingProfile(mappingProfile)),
       id: generateMappingProfileId(),
       name: "",
       builtIn: false,
@@ -719,7 +1411,10 @@ function App() {
   };
 
   const saveMappingLibraryProfile = (profile: MappingProfile) => {
-    const nextProfile = { ...cloneMappingProfile(profile), builtIn: false };
+    const nextProfile = {
+      ...normalizeMappingProfile(cloneMappingProfile(profile)),
+      builtIn: false,
+    };
     const exists = customMappingProfiles.some((item) => item.id === nextProfile.id);
     const updatedProfiles = exists
       ? customMappingProfiles.map((item) => item.id === nextProfile.id ? nextProfile : item)
@@ -727,10 +1422,7 @@ function App() {
 
     persistCustomMappingProfiles(updatedProfiles);
     setEditingMappingProfile(null);
-
-    if (activeMappingProfileId === nextProfile.id) {
-      commitMappingProfile(nextProfile, nextProfile.id);
-    }
+    commitMappingProfile(nextProfile, nextProfile.id);
   };
 
   const deleteMappingLibraryProfile = (id: string) => {
@@ -745,7 +1437,7 @@ function App() {
   };
 
   const loadCustomMappingProfileForEditing = (profile: MappingProfile) => {
-    setEditingMappingProfile(cloneMappingProfile(profile));
+    setEditingMappingProfile(normalizeMappingProfile(cloneMappingProfile(profile)));
   };
 
   const handleButtonBindingTypeChange = (button: ControllerButton, type: ButtonBindingTarget["type"]) => {
@@ -773,6 +1465,10 @@ function App() {
     updateCurrentMappingProfile(profile => ({ ...cloneMappingProfile(profile), [side]: binding }));
   };
 
+  const handleMappingEmulationTargetChange = (target: MappingProfile["emulationTarget"]) => {
+    updateCurrentMappingProfile((profile) => convertMappingProfileEmulationTarget(profile, target));
+  };
+
   const updateCalibration = (updater: (profile: CalibrationProfile) => CalibrationProfile) => {
     const next = updater(cloneCalibrationProfile(calibrationProfile));
     commitCalibrationProfile(next);
@@ -794,12 +1490,38 @@ function App() {
     commitCalibrationProfile(DEFAULT_CALIBRATION_PROFILE);
   };
 
+  const resetStickCalibration = (side: "leftStick" | "rightStick") => {
+    updateCalibration(profile => ({
+      ...profile,
+      [side]: { ...DEFAULT_CALIBRATION_PROFILE[side] },
+    }));
+  };
+
+  const resetTriggerCalibration = (side: "leftTrigger" | "rightTrigger") => {
+    updateCalibration(profile => ({
+      ...profile,
+      [side]: { ...DEFAULT_CALIBRATION_PROFILE[side] },
+    }));
+  };
+
   const runFirmwareCommand = async (command: string) => {
     try {
       const status = await invoke<FirmwareCalibrationStatus>(command);
       setFirmwareStatus(status);
     } catch (e) {
       console.error(`Failed to run firmware calibration command "${command}":`, e);
+      const message = e instanceof Error ? e.message : String(e);
+      setFirmwareStatus((current) => ({
+        ...current,
+        busy: false,
+        step: "error",
+        canSampleCenter: false,
+        canStoreTemporarily: false,
+        canStorePermanently: false,
+        requiresStickRotation: false,
+        lastError: message,
+        lastMessage: `Firmware calibration command failed: ${message}`,
+      }));
     }
   };
 
@@ -844,6 +1566,39 @@ function App() {
     }
   };
 
+  const allLightingProfiles = [...BUILTIN_LIGHTING_PROFILES, ...customLightingProfiles];
+  const activeLightingProfile = getLightingProfile(allLightingProfiles, activeLightingProfileId);
+  const isSavedLightingProfile = Boolean(activeLightingProfileId);
+  const isEditingCustomLightingProfile = customLightingProfiles.some((profile) => profile.id === lightingDraft.id);
+  const activeHapticProfile = allHapticProfiles.find((profile) => profile.id === activeProfileId) ?? null;
+  const ocrCalibrationReady = adaptiveTriggers.nfsHeat.ocrCalibration !== null;
+  const manualOcrProcessName = adaptiveTriggers.nfsHeat.ocrProcessName;
+  const liveTelemetryAttached = adaptiveTriggers.inputSource === "live" && gameTelemetryStatus.stage === "attached";
+  const adaptivePreview = liveTelemetryAttached
+    ? computeNeedForSpeedHeatAdaptiveTriggersForSpeed(
+      adaptiveTriggers.nfsHeat,
+      gameTelemetryStatus.speedKph ?? adaptiveTriggers.nfsHeat.demoSpeedKph,
+    )
+    : computeAdaptiveTriggerPreview(adaptiveTriggers);
+  const adaptiveStrengthPercent = Math.round(adaptivePreview.normalizedSpeed * 100);
+  const adaptiveActiveSpeedKph = adaptivePreview.speedKph;
+  const adaptiveStatusTone = getTelemetryToneClasses(gameTelemetryStatus.stage);
+  const calibrationDraftStyle = ocrCalibrationPreview && ocrCalibrationDraft
+    ? {
+        left: `${(ocrCalibrationDraft.originX / ocrCalibrationPreview.width) * 100}%`,
+        top: `${(ocrCalibrationDraft.originY / ocrCalibrationPreview.height) * 100}%`,
+        width: `${(ocrCalibrationDraft.width / ocrCalibrationPreview.width) * 100}%`,
+        height: `${(ocrCalibrationDraft.height / ocrCalibrationPreview.height) * 100}%`,
+      }
+    : null;
+  const speakerTestSupported = isConnected && firmwareStatus.transport !== "unknown";
+  const micTestSupported = isConnected && firmwareStatus.transport !== "unknown";
+  const bluetoothAudioExperimental = firmwareStatus.transport === "bluetooth";
+  const transportLabel = getTransportLabel(firmwareStatus.transport);
+  const transportIcon = firmwareStatus.transport === "bluetooth" ? Bluetooth : Usb;
+  const previewGlow = `rgba(${lightingPreviewRgb.r}, ${lightingPreviewRgb.g}, ${lightingPreviewRgb.b}, 0.45)`;
+  const TransportIcon = transportIcon;
+
   return (
     <div className="h-screen bg-[#0a0a0a] text-white flex flex-col overflow-hidden relative border border-white/10 rounded-xl">
       {toast && (
@@ -864,6 +1619,74 @@ function App() {
               <div>
                 <p className="text-sm font-semibold text-white">{toast.title}</p>
                 <p className="mt-1 text-sm text-white/70">{toast.message}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {ocrCalibrationPreview && (
+        <div className="absolute inset-0 z-[95] bg-black/70 backdrop-blur-sm flex items-center justify-center p-6">
+          <div className="w-full max-w-5xl rounded-3xl border border-white/10 bg-[#101010] shadow-2xl overflow-hidden">
+            <div className="flex items-start justify-between gap-4 border-b border-white/10 px-6 py-5">
+              <div>
+                <h3 className="text-xl font-semibold">Calibrate Racing Game OCR Region</h3>
+                <p className="text-sm text-white/45 mt-1">
+                  Drag a tight rectangle around the in-game speed digits. WinSense will crop and OCR only this region during Live mode.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeOcrCalibrationModal}
+                className="rounded-xl border border-white/10 px-3 py-2 text-sm text-white/70 hover:bg-white/5"
+              >
+                Close
+              </button>
+            </div>
+            <div className="p-6 space-y-5">
+              <div
+                className="relative rounded-2xl overflow-hidden border border-white/10 bg-black/40 select-none"
+                onPointerDown={beginOcrCalibrationDrag}
+                onPointerMove={updateOcrCalibrationDrag}
+                onPointerUp={finishOcrCalibrationDrag}
+                onPointerLeave={finishOcrCalibrationDrag}
+              >
+                <img
+                  ref={ocrPreviewImageRef}
+                  src={ocrCalibrationPreview.imageDataUrl}
+                  alt="Racing game OCR preview"
+                  className="block w-full h-auto max-h-[65vh] object-contain"
+                  draggable={false}
+                />
+                {calibrationDraftStyle && (
+                  <div
+                    className="absolute border-2 border-cyan-400 bg-cyan-400/15 shadow-[0_0_0_9999px_rgba(0,0,0,0.35)] pointer-events-none"
+                    style={calibrationDraftStyle}
+                  />
+                )}
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <p className="text-sm text-white/45">
+                  {ocrCalibrationDraft
+                    ? `Selection: ${ocrCalibrationDraft.width} x ${ocrCalibrationDraft.height} at ${ocrCalibrationDraft.originX}, ${ocrCalibrationDraft.originY}`
+                    : "Click and drag over the screenshot to define the speedometer crop."}
+                </p>
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => void loadOcrCalibrationPreview()}
+                    disabled={ocrCalibrationLoading}
+                    className="px-4 py-2 rounded-xl text-sm font-medium glass-button disabled:opacity-60"
+                  >
+                    Refresh Preview
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveOcrCalibration}
+                    className="px-4 py-2 rounded-xl text-sm font-medium bg-cyan-500 text-slate-950"
+                  >
+                    Save Calibration
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -909,55 +1732,64 @@ function App() {
         </div>
       </div>
 
-      <div className="flex-1 flex overflow-hidden min-h-0">
+      <div className="flex-1 flex overflow-hidden min-h-0 relative">
         {/* Background ambient glow */}
-        <div className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full opacity-20 blur-[80px] pointer-events-none" style={{ background: lightingEnabled ? `radial-gradient(circle, rgb(${rgb.r}, ${rgb.g}, ${rgb.b}) 0%, transparent 70%)` : 'transparent' }}></div>
+        <div
+          className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full opacity-20 blur-[80px] pointer-events-none"
+          style={{
+            background: lightingEnabled
+              ? `radial-gradient(circle, rgb(${lightingPreviewRgb.r}, ${lightingPreviewRgb.g}, ${lightingPreviewRgb.b}) 0%, transparent 70%)`
+              : "transparent",
+          }}
+        />
         <div className="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] rounded-full opacity-10 blur-[120px] pointer-events-none bg-blue-600"></div>
 
-        {/* Sidebar */}
-        <div className="w-64 glass border-r border-white/5 p-6 flex flex-col gap-2 z-10">
-          <div className="flex items-center gap-3 mb-10 px-2 mt-4">
-            <div className="overflow-hidden rounded-xl shadow-lg shadow-blue-500/20 ring-1 ring-white/10">
-              <img src={winSenseMark} alt="" className="h-10 w-10 object-cover object-top" draggable={false} />
-            </div>
-            <h1 className="text-2xl font-black tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-white/60">WinSense</h1>
-          </div>
+        {isConnected ? (
+          <>
+            {/* Sidebar */}
+            <div className="w-64 glass border-r border-white/5 p-6 flex flex-col gap-2 z-10">
+              <div className="flex items-center gap-3 mb-10 px-2 mt-4">
+                <div className="overflow-hidden rounded-xl shadow-lg shadow-blue-500/20 ring-1 ring-white/10">
+                  <img src={winSenseMark} alt="" className="h-10 w-10 object-cover object-top" draggable={false} />
+                </div>
+                <h1 className="text-2xl font-black tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-white/60">WinSense</h1>
+              </div>
 
-          <div className="space-y-2">
-            {[
-              { id: "dashboard", icon: Gamepad2, label: "Dashboard" },
-              { id: "calibration", icon: Sliders, label: "Calibration" },
-              { id: "mapping", icon: Keyboard, label: "Mapping" },
-              { id: "lighting", icon: Palette, label: "Lighting" },
-              { id: "triggers", icon: Sliders, label: "Triggers" },
-              { id: "settings", icon: Settings, label: "Settings" }
-            ].map((item) => (
-              <button 
-                key={item.id}
-                onClick={() => setActiveTab(item.id)}
-                className={`w-full flex items-center gap-3 px-4 py-3.5 rounded-xl transition-all duration-300 font-medium ${
-                  activeTab === item.id 
-                    ? "bg-white/10 text-white shadow-[inset_0_1px_1px_rgba(255,255,255,0.1)] border border-white/10" 
-                    : "text-white/50 hover:bg-white/5 hover:text-white border border-transparent"
-                }`}
-              >
-                <item.icon size={20} className={activeTab === item.id ? "text-blue-400" : ""} /> {item.label}
-              </button>
-            ))}
-          </div>
-          
-          <div className="mt-auto pt-6 border-t border-white/5">
-            <div className={`flex items-center gap-3 px-4 py-3 rounded-xl border transition-colors duration-300 ${isConnected ? 'bg-green-500/10 border-green-500/20' : 'bg-red-500/10 border-red-500/20'}`}>
-              <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.8)]' : 'bg-red-500'}`}></div>
-              <span className={`text-sm font-medium ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
-                {isConnected ? 'Connected' : 'Disconnected'}
-              </span>
-            </div>
-          </div>
-        </div>
+              <div className="space-y-2">
+                {[
+                  { id: "dashboard", icon: Gamepad2, label: "Dashboard" },
+                  { id: "calibration", icon: Sliders, label: "Calibration" },
+                  { id: "mapping", icon: Keyboard, label: "Mapping" },
+                  { id: "lighting", icon: Palette, label: "Lighting" },
+                  { id: "haptics", icon: Zap, label: "Haptics" },
+                  { id: "adaptiveTriggers", icon: Sliders, label: "Adaptive Triggers" },
+                  { id: "audio", icon: Volume2, label: "Audio" },
+                  { id: "settings", icon: Settings, label: "Settings" }
+                ].map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => setActiveTab(item.id)}
+                    className={`w-full flex items-center gap-3 px-4 py-3.5 rounded-xl transition-all duration-300 font-medium ${
+                      activeTab === item.id
+                        ? "bg-white/10 text-white shadow-[inset_0_1px_1px_rgba(255,255,255,0.1)] border border-white/10"
+                        : "text-white/50 hover:bg-white/5 hover:text-white border border-transparent"
+                    }`}
+                  >
+                    <item.icon size={20} className={activeTab === item.id ? "text-blue-400" : ""} /> {item.label}
+                  </button>
+                ))}
+              </div>
 
-        {/* Main Content */}
-        <div className="flex-1 p-10 overflow-y-auto z-10">
+              <div className="mt-auto pt-6 border-t border-white/5">
+                <div className="flex items-center gap-3 px-4 py-3 rounded-xl border transition-colors duration-300 bg-green-500/10 border-green-500/20">
+                  <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.8)]"></div>
+                  <span className="text-sm font-medium text-green-400">Connected</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Main Content */}
+            <div className="flex-1 p-10 overflow-y-auto z-10">
           {activeTab === "dashboard" && (
             <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
               <header className="mb-10 flex justify-between items-end">
@@ -976,7 +1808,7 @@ function App() {
                   <Gamepad2
                     size={160}
                     className={`mb-8 z-10 drop-shadow-2xl transition-all duration-500 group-hover:scale-105 ${isConnected ? "text-white/80" : "text-white/20"}`}
-                    style={{ filter: (isConnected && lightingEnabled) ? `drop-shadow(0 10px 20px rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.4))` : "none" }}
+                    style={{ filter: (isConnected && lightingEnabled) ? `drop-shadow(0 10px 20px ${previewGlow})` : "none" }}
                   />
                   
                   {isConnected ? (
@@ -986,8 +1818,11 @@ function App() {
                         <span className="text-sm font-medium">85%</span>
                       </div>
                       <div className="flex items-center gap-2 glass px-4 py-2 rounded-full">
-                        <Usb size={16} className="text-blue-400" />
-                        <span className="text-sm font-medium">USB</span>
+                        <TransportIcon
+                          size={16}
+                          className={firmwareStatus.transport === "bluetooth" ? "text-cyan-400" : "text-blue-400"}
+                        />
+                        <span className="text-sm font-medium">{transportLabel}</span>
                       </div>
                     </div>
                   ) : (
@@ -1007,15 +1842,15 @@ function App() {
                       <button 
                         disabled={!isConnected}
                         onClick={() => {
-                          const reset = { ...DEFAULT_TRIGGER };
+                          const reset = cloneTriggerEffect(DEFAULT_TRIGGER_EFFECT);
                           setLeftTrigger(reset);
-                          setRightTrigger(reset);
+                          setRightTrigger(cloneTriggerEffect(DEFAULT_TRIGGER_EFFECT));
                           setActiveProfileId(null);
-                          sendTriggers(reset, reset);
+                          sendTriggers(reset, cloneTriggerEffect(DEFAULT_TRIGGER_EFFECT));
                         }}
                         className="w-full glass-button py-3 rounded-xl font-medium flex justify-center items-center gap-2 text-white/70 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
-                        Reset Triggers
+                        Reset Haptics
                       </button>
                     </div>
                   </div>
@@ -1032,275 +1867,48 @@ function App() {
           )}
 
           {activeTab === "mapping" && mappingProfile && (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4 mb-8">
-                <div>
-                  <h2 className="text-4xl font-bold mb-2">Mapping</h2>
-                  <p className="text-white/50 max-w-3xl">
-                    Remap every controller button, stick, and trigger. The Create button near the D-pad
-                    is now exposed as <span className="font-medium text-white/70">Create (B8)</span>, and the
-                    built-in Keyboard + Mouse preset lets you use the controller in games without native support.
-                  </p>
-                </div>
-                <div className="glass-panel p-4 rounded-2xl min-w-[260px]">
-                  <div className="text-xs uppercase tracking-[0.2em] text-white/30 mb-2">Preset</div>
-                  <div className="relative">
-                    <select
-                      value={activeMappingProfileId ?? ""}
-                      onChange={(e) => {
-                        if (e.target.value) {
-                          applyMappingPreset(e.target.value);
-                          return;
-                        }
-                        commitMappingProfile(toManualProfile(mappingProfile), null);
-                      }}
-                      className="w-full glass-input rounded-xl p-3 pr-9 text-white outline-none appearance-none font-medium text-sm"
-                    >
-                      <option value="" className="bg-neutral-900">Manual / Custom</option>
-                      {mappingPresets.map((preset) => (
-                        <option key={preset.id} value={preset.id} className="bg-neutral-900">
-                          {preset.name} (Built-in)
-                        </option>
-                      ))}
-                      {customMappingProfiles.map((preset) => (
-                        <option key={preset.id} value={preset.id} className="bg-neutral-900">
-                          {preset.name}
-                        </option>
-                      ))}
-                    </select>
-                    <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
-                  </div>
-                  <div className="text-xs text-white/35 mt-2">
-                    Built-ins apply instantly. Editing a selected custom profile updates it automatically.
-                  </div>
-                  <button
-                    onClick={createMappingProfileFromCurrent}
-                    className="mt-3 glass-button w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium"
-                  >
-                    <Plus size={15} /> Save Current as Profile
-                  </button>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 mb-6">
-                <StickBindingCard
-                  title="Left Stick"
-                  subtitle="Use it as Xbox movement, keyboard movement, or disable it."
-                  binding={mappingProfile.leftStick}
-                  onChange={(binding) => handleStickBindingChange("leftStick", binding)}
-                />
-                <StickBindingCard
-                  title="Right Stick"
-                  subtitle="Keep Xbox camera aim or turn it into mouse movement."
-                  binding={mappingProfile.rightStick}
-                  onChange={(binding) => handleStickBindingChange("rightStick", binding)}
-                />
-                <TriggerBindingCard
-                  title="Left Trigger"
-                  subtitle="Bind L2 to an Xbox trigger, key, mouse button, or disable it."
-                  binding={mappingProfile.leftTrigger}
-                  onChange={(binding) => handleTriggerBindingChange("leftTrigger", binding)}
-                />
-                <TriggerBindingCard
-                  title="Right Trigger"
-                  subtitle="Bind R2 to an Xbox trigger, key, mouse button, or disable it."
-                  binding={mappingProfile.rightTrigger}
-                  onChange={(binding) => handleTriggerBindingChange("rightTrigger", binding)}
-                />
-              </div>
-
-              <div className="glass-panel p-8 rounded-3xl">
-                <div className="flex items-center justify-between gap-4 mb-6">
-                  <div>
-                    <h3 className="text-2xl font-semibold">Button Bindings</h3>
-                    <p className="text-white/45 text-sm mt-1">
-                      Every digital button can target Xbox input, keyboard keys, mouse buttons, or stay disabled.
-                    </p>
-                  </div>
-                  <div className="text-xs text-white/35 text-right">
-                    Touchpad click bindings are ignored while <span className="text-white/60">Touchpad as Mouse</span> is enabled.
-                  </div>
-                </div>
-
-                <div className="space-y-3">
-                  {CONTROLLER_BUTTONS.map((button) => (
-                    <MappingButtonRow
-                      key={button.id}
-                      label={button.label}
-                      description={button.description}
-                      binding={getButtonBinding(mappingProfile, button.id)}
-                      onTypeChange={(type) => handleButtonBindingTypeChange(button.id, type)}
-                      onBindingChange={(binding) => handleButtonBindingValueChange(button.id, binding)}
-                    />
-                  ))}
-                </div>
-              </div>
-            </div>
+            <MappingEditor
+              mappingProfile={mappingProfile}
+              activeMappingProfileId={activeMappingProfileId}
+              mappingPresets={mappingPresets}
+              customMappingProfiles={customMappingProfiles}
+              editingMappingProfile={editingMappingProfile}
+              onSelectProfile={(profileId) => {
+                if (profileId) {
+                  applyMappingPreset(profileId);
+                  return;
+                }
+                commitMappingProfile(toManualProfile(mappingProfile), null);
+              }}
+              onCreateProfile={createMappingProfileFromCurrent}
+              onSaveEditingProfile={saveMappingLibraryProfile}
+              onEditingProfileChange={setEditingMappingProfile}
+              onDeleteProfile={deleteMappingLibraryProfile}
+              onLoadProfileForEditing={loadCustomMappingProfileForEditing}
+              onEmulationTargetChange={handleMappingEmulationTargetChange}
+              onButtonBindingTypeChange={handleButtonBindingTypeChange}
+              onButtonBindingChange={handleButtonBindingValueChange}
+              onStickBindingChange={handleStickBindingChange}
+              onTriggerBindingChange={handleTriggerBindingChange}
+            />
           )}
 
           {activeTab === "calibration" && (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4 mb-8">
-                <div>
-                  <h2 className="text-4xl font-bold mb-2">Calibration</h2>
-                  <p className="text-white/50 max-w-3xl">
-                    Tune software calibration to reduce stick drift and adjust trigger response. This masks minor drift in-app,
-                    but it does not repair worn hardware inside the controller.
-                  </p>
-                </div>
-                <div className="flex gap-3">
-                  <button onClick={resetCalibration} className="glass-button px-5 py-2.5 rounded-xl font-medium text-white/80">
-                    Reset Calibration
-                  </button>
-                </div>
-              </div>
-
-              <div className="glass-panel p-6 rounded-3xl mb-6">
-                <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-6">
-                  <div className="max-w-3xl">
-                    <div className="text-sm font-medium text-white/80 mb-2">Firmware-Level Calibration</div>
-                    <p className="text-sm text-white/50 leading-relaxed mb-4">
-                      {calibrationCapabilities?.firmwareCalibrationNote ?? "Firmware calibration uses undocumented DualSense USB commands and should be treated as an advanced repair workflow."}
-                    </p>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
-                      <div className="bg-black/20 rounded-2xl border border-white/5 p-4">
-                        <div className="text-xs uppercase tracking-[0.15em] text-white/35 mb-2">Transport</div>
-                        <div className="font-medium capitalize">{firmwareStatus.transport}</div>
-                      </div>
-                      <div className="bg-black/20 rounded-2xl border border-white/5 p-4">
-                        <div className="text-xs uppercase tracking-[0.15em] text-white/35 mb-2">Status</div>
-                        <div className="font-medium">{formatFirmwareStep(firmwareStatus.step)}</div>
-                      </div>
-                      <div className="bg-black/20 rounded-2xl border border-white/5 p-4">
-                        <div className="text-xs uppercase tracking-[0.15em] text-white/35 mb-2">Last Mode</div>
-                        <div className="font-medium capitalize">{firmwareStatus.lastCompletedMode ?? "None"}</div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="lg:max-w-md w-full">
-                    <div className="bg-black/20 rounded-2xl border border-white/5 p-4 mb-4">
-                      <div className="text-sm text-white/80 mb-2">Instructions</div>
-                      <p className="text-sm text-white/50 leading-relaxed">
-                        {firmwareStatus.lastMessage}
-                      </p>
-                      {firmwareStatus.lastError && (
-                        <p className="text-sm text-red-400 mt-3">
-                          {firmwareStatus.lastError}
-                        </p>
-                      )}
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
-                      <button
-                        disabled={!firmwareStatus.eligible || firmwareStatus.busy}
-                        onClick={() => void runFirmwareCommand("start_firmware_center_calibration")}
-                        className="glass-button px-4 py-3 rounded-xl text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        Start Center Calibration
-                      </button>
-                      <button
-                        disabled={!firmwareStatus.eligible || firmwareStatus.busy}
-                        onClick={() => void runFirmwareCommand("start_firmware_range_calibration")}
-                        className="glass-button px-4 py-3 rounded-xl text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        Start Range Calibration
-                      </button>
-                      <button
-                        disabled={!firmwareStatus.canSampleCenter}
-                        onClick={() => void runFirmwareCommand("sample_firmware_center_calibration")}
-                        className="glass-button px-4 py-3 rounded-xl text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        Sample Center
-                      </button>
-                      <button
-                        disabled={!firmwareStatus.canStoreTemporarily}
-                        onClick={() => void runFirmwareCommand(
-                          firmwareStatus.activeMode === "center"
-                            ? "store_firmware_center_calibration"
-                            : "store_firmware_range_calibration"
-                        )}
-                        className="glass-button px-4 py-3 rounded-xl text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        Store Temporarily
-                      </button>
-                    </div>
-
-                    <label className="flex items-start gap-3 text-sm text-white/55 mb-4">
-                      <input
-                        type="checkbox"
-                        checked={firmwareRiskAccepted}
-                        onChange={(e) => setFirmwareRiskAccepted(e.target.checked)}
-                        className="mt-1"
-                      />
-                      <span>
-                        I understand permanent firmware calibration writes directly to the controller and may fail on unsupported firmware or hardware.
-                      </span>
-                    </label>
-
-                    <div className="flex flex-col sm:flex-row gap-3">
-                      <button
-                        disabled={!firmwareStatus.canStorePermanently || !firmwareRiskAccepted}
-                        onClick={() => void runFirmwareCommand("save_firmware_calibration_permanently")}
-                        className="bg-amber-600 hover:bg-amber-500 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-3 rounded-xl text-sm font-medium transition-colors"
-                      >
-                        Save Permanently
-                      </button>
-                      <button
-                        disabled={!firmwareStatus.busy}
-                        onClick={() => void runFirmwareCommand("cancel_firmware_calibration")}
-                        className="glass-button px-4 py-3 rounded-xl text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        Cancel Session
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 mb-6">
-                <CalibrationStickCard
-                  title="Left Stick"
-                  snapshot={liveInput.leftStick}
-                  calibration={calibrationProfile.leftStick}
-                  onCenterFromCurrent={() => setStickCenterFromCurrent("leftStick")}
-                  onChange={(nextStick) => updateCalibration(profile => ({ ...profile, leftStick: nextStick }))}
-                />
-                <CalibrationStickCard
-                  title="Right Stick"
-                  snapshot={liveInput.rightStick}
-                  calibration={calibrationProfile.rightStick}
-                  onCenterFromCurrent={() => setStickCenterFromCurrent("rightStick")}
-                  onChange={(nextStick) => updateCalibration(profile => ({ ...profile, rightStick: nextStick }))}
-                />
-                <CalibrationTriggerCard
-                  title="Left Trigger"
-                  snapshot={liveInput.leftTrigger}
-                  calibration={calibrationProfile.leftTrigger}
-                  onChange={(nextTrigger) => updateCalibration(profile => ({ ...profile, leftTrigger: nextTrigger }))}
-                />
-                <CalibrationTriggerCard
-                  title="Right Trigger"
-                  snapshot={liveInput.rightTrigger}
-                  calibration={calibrationProfile.rightTrigger}
-                  onChange={(nextTrigger) => updateCalibration(profile => ({ ...profile, rightTrigger: nextTrigger }))}
-                />
-              </div>
-
-              <div className="glass-panel p-6 rounded-3xl">
-                <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-                  <div>
-                    <h3 className="text-lg font-semibold mb-1">Live Input</h3>
-                    <p className="text-white/45 text-sm">
-                      Use these values to spot drift. Small movement at rest means increasing deadzone or setting center may help.
-                    </p>
-                  </div>
-                  <div className="text-sm text-white/35">
-                    Pressed buttons: {liveInput.pressedButtons.length > 0 ? liveInput.pressedButtons.join(", ") : "None"}
-                  </div>
-                </div>
-              </div>
-            </div>
+            <CalibrationPanel
+              calibrationProfile={calibrationProfile}
+              liveInput={liveInput}
+              calibrationCapabilities={calibrationCapabilities}
+              firmwareStatus={firmwareStatus}
+              firmwareRiskAccepted={firmwareRiskAccepted}
+              onFirmwareRiskAcceptedChange={setFirmwareRiskAccepted}
+              onResetCalibration={resetCalibration}
+              onSetStickCenterFromCurrent={setStickCenterFromCurrent}
+              onResetStick={resetStickCalibration}
+              onUpdateStick={(side, nextStick) => updateCalibration(profile => ({ ...profile, [side]: nextStick }))}
+              onResetTrigger={resetTriggerCalibration}
+              onUpdateTrigger={(side, nextTrigger) => updateCalibration(profile => ({ ...profile, [side]: nextTrigger }))}
+              onRunFirmwareCommand={(command) => void runFirmwareCommand(command)}
+            />
           )}
 
           {activeTab === "lighting" && (
@@ -1308,147 +1916,1246 @@ function App() {
               <div className="flex justify-between items-end mb-10">
                 <div>
                   <h2 className="text-4xl font-bold mb-2">Lighting</h2>
-                  <p className="text-white/50">Customize the controller's RGB lightbar.</p>
+                  <p className="text-white/50">Build your own lighting library with saved static, cycle, pulse, and wave profiles.</p>
                 </div>
-                <button 
+                <button
                   onClick={toggleLighting}
                   className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-medium transition-colors ${lightingEnabled ? 'bg-blue-600 text-white' : 'glass-button text-white/50'}`}
                 >
                   <Power size={18} /> {lightingEnabled ? 'Enabled' : 'Disabled'}
                 </button>
               </div>
-              
-              <div className={`glass-panel p-8 rounded-3xl max-w-2xl transition-opacity duration-300 ${!lightingEnabled ? 'opacity-50 pointer-events-none' : ''}`}>
-                {/* Preview Bar */}
-                <div className="mb-10 p-1 rounded-2xl glass">
-                  <div 
-                    className="h-24 rounded-xl w-full transition-colors duration-300 relative overflow-hidden" 
-                    style={{ backgroundColor: `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`, boxShadow: `inset 0 0 20px rgba(0,0,0,0.2), 0 0 40px rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.4)` }}
-                  >
-                    <div className="absolute inset-0 bg-gradient-to-b from-white/20 to-transparent"></div>
+
+              <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.1fr)_minmax(320px,0.95fr)] gap-6">
+                <div className="space-y-6">
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex items-start justify-between gap-4 mb-6">
+                      <div>
+                        <h3 className="text-xl font-semibold">Lighting Library</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Built-ins are ready to use, and custom profiles can be saved, updated, and deleted.
+                        </p>
+                      </div>
+                      <button
+                        onClick={startNewLightingProfile}
+                        className="glass-button flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium"
+                      >
+                        <Plus size={16} /> New Profile
+                      </button>
+                    </div>
+
+                    <div className="space-y-6">
+                      <div>
+                        <div className="text-xs uppercase tracking-[0.18em] text-white/30 mb-3">Built-in</div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {BUILTIN_LIGHTING_PROFILES.map((profile) => {
+                            const swatch = computeLightingColor(profile);
+                            const isActive = activeLightingProfileId === profile.id;
+
+                            return (
+                              <button
+                                key={profile.id}
+                                type="button"
+                                onClick={() => applyLightingProfile(profile)}
+                                className={`text-left rounded-2xl border p-4 transition-all duration-200 ${
+                                  isActive
+                                    ? "border-blue-400/40 bg-blue-500/10 shadow-[0_0_0_1px_rgba(96,165,250,0.2)]"
+                                    : "border-white/8 bg-white/[0.03] hover:border-white/20 hover:bg-white/[0.05]"
+                                }`}
+                              >
+                                <div className="flex items-start justify-between gap-4 mb-4">
+                                  <div>
+                                    <div className="font-semibold text-white">{profile.name}</div>
+                                    <div className="mt-1 text-xs uppercase tracking-[0.18em] text-white/35">{profile.effect}</div>
+                                  </div>
+                                  <div
+                                    className="h-11 w-11 rounded-xl border border-white/10 shrink-0"
+                                    style={{
+                                      background: `linear-gradient(135deg, rgb(${swatch.r}, ${swatch.g}, ${swatch.b}) 0%, rgba(${swatch.r}, ${swatch.g}, ${swatch.b}, 0.55) 100%)`,
+                                      boxShadow: `0 0 22px rgba(${swatch.r}, ${swatch.g}, ${swatch.b}, 0.28)`,
+                                    }}
+                                  />
+                                </div>
+                                <p className="text-sm leading-relaxed text-white/55">{profile.description}</p>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="text-xs uppercase tracking-[0.18em] text-white/30 mb-3">Custom</div>
+                        <div className="space-y-3">
+                          {customLightingProfiles.map((profile) => {
+                            const swatch = computeLightingColor(profile);
+                            const isActive = activeLightingProfileId === profile.id;
+
+                            return (
+                              <div
+                                key={profile.id}
+                                className={`rounded-2xl border p-4 transition-colors ${
+                                  isActive
+                                    ? "border-fuchsia-400/40 bg-fuchsia-500/10"
+                                    : "border-white/8 bg-white/[0.03]"
+                                }`}
+                              >
+                                <div className="flex items-start justify-between gap-4">
+                                  <button type="button" onClick={() => applyLightingProfile(profile)} className="flex-1 text-left">
+                                    <div className="flex items-start justify-between gap-4">
+                                      <div>
+                                        <div className="font-semibold text-white">{profile.name}</div>
+                                        <div className="mt-1 text-xs uppercase tracking-[0.18em] text-white/35">{profile.effect}</div>
+                                        <p className="mt-2 text-sm text-white/50">{profile.description || "Custom lighting profile"}</p>
+                                      </div>
+                                      <div
+                                        className="h-11 w-11 rounded-xl border border-white/10 shrink-0"
+                                        style={{
+                                          background: `linear-gradient(135deg, rgb(${swatch.r}, ${swatch.g}, ${swatch.b}) 0%, rgba(${swatch.r}, ${swatch.g}, ${swatch.b}, 0.55) 100%)`,
+                                          boxShadow: `0 0 22px rgba(${swatch.r}, ${swatch.g}, ${swatch.b}, 0.28)`,
+                                        }}
+                                      />
+                                    </div>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => deleteLightingProfile(profile.id)}
+                                    className="p-2 hover:bg-red-500/20 rounded-lg transition-colors text-white/40 hover:text-red-400"
+                                    title="Delete profile"
+                                  >
+                                    <Trash2 size={16} />
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                          {customLightingProfiles.length === 0 && (
+                            <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.02] p-6 text-sm text-white/35">
+                              No custom lighting profiles yet. Start from a built-in effect or create one from scratch.
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="mb-8 p-1 rounded-2xl glass">
+                      <div
+                        className="h-28 rounded-xl w-full transition-colors duration-300 relative overflow-hidden"
+                        style={{
+                          background: `linear-gradient(90deg, rgba(${lightingPreviewRgb.r}, ${lightingPreviewRgb.g}, ${lightingPreviewRgb.b}, 0.7) 0%, rgb(${lightingPreviewRgb.r}, ${lightingPreviewRgb.g}, ${lightingPreviewRgb.b}) 50%, rgba(${lightingPreviewRgb.r}, ${lightingPreviewRgb.g}, ${lightingPreviewRgb.b}, 0.7) 100%)`,
+                          boxShadow: `inset 0 0 20px rgba(0,0,0,0.2), 0 0 40px ${previewGlow}`,
+                        }}
+                      >
+                        <div className="absolute inset-0 bg-gradient-to-b from-white/20 to-transparent" />
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-3">
+                      <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-sm text-white/70">
+                        Live preview: <span className="text-white font-medium">{lightingDraft.name.trim() || "Untitled Draft"}</span>
+                      </span>
+                      <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-sm text-white/50">
+                        Effect: <span className="text-white/80 capitalize">{lightingDraft.effect}</span>
+                      </span>
+                      <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-sm text-white/50">
+                        {isSavedLightingProfile ? "Applied saved profile" : "Unsaved draft"}
+                      </span>
+                    </div>
                   </div>
                 </div>
 
-                <div className="space-y-8">
-                  {[
-                    { label: 'Red', color: 'r', value: rgb.r, hex: '#ef4444' },
-                    { label: 'Green', color: 'g', value: rgb.g, hex: '#22c55e' },
-                    { label: 'Blue', color: 'b', value: rgb.b, hex: '#3b82f6' }
-                  ].map((channel) => (
-                    <div key={channel.color}>
-                      <div className="flex justify-between mb-3">
-                        <span className="font-medium" style={{ color: channel.hex }}>{channel.label}</span>
-                        <span className="text-white/50 font-mono bg-black/30 px-2 py-0.5 rounded-md text-sm">{channel.value}</span>
+                <div className="space-y-6">
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex items-start justify-between gap-4 mb-6">
+                      <div>
+                        <h3 className="text-lg font-semibold">Profile Editor</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Changes update the live preview immediately. Save when you want to reuse the profile later.
+                        </p>
                       </div>
-                      <div className="relative h-2 rounded-full bg-white/10">
-                        <div 
-                          className="absolute top-0 left-0 h-full rounded-full" 
-                          style={{ width: `${(channel.value / 255) * 100}%`, backgroundColor: channel.hex }}
-                        ></div>
-                        <input 
-                          type="range" min="0" max="255" value={channel.value} 
-                          onChange={(e) => handleColorChange(channel.color, parseInt(e.target.value))}
-                          className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer"
-                        />
-                        {/* Custom thumb overlay */}
-                        <div 
-                          className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full shadow-lg pointer-events-none"
-                          style={{ left: `calc(${(channel.value / 255) * 100}% - 8px)` }}
-                        ></div>
-                      </div>
+                      {!lightingEnabled && (
+                        <span className="text-xs uppercase tracking-[0.18em] text-amber-300/70">Output off</span>
+                      )}
                     </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {activeTab === "triggers" && (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <h2 className="text-4xl font-bold mb-2">Adaptive Triggers</h2>
-              <p className="text-white/50 mb-6">Configure haptic feedback and resistance for L2 and R2.</p>
-
-              {/* Profile selector */}
-              <div className="glass-panel p-5 rounded-2xl mb-6 flex items-center gap-4 flex-wrap">
-                <span className="text-sm font-medium text-white/60">Haptic Profile:</span>
-                <div className="relative flex-1 min-w-[200px] max-w-xs">
-                  <select
-                    value={activeProfileId ?? ""}
-                    onChange={(e) => {
-                      const id = e.target.value;
-                      if (!id) { setActiveProfileId(null); return; }
-                      const p = hapticProfiles.find(hp => hp.id === id);
-                      if (p) applyHapticProfile(p);
-                    }}
-                    className="w-full glass-input rounded-xl p-3 text-white outline-none appearance-none font-medium text-sm"
-                  >
-                    <option value="" className="bg-neutral-900">Manual / Custom</option>
-                    {hapticProfiles.map(p => (
-                      <option key={p.id} value={p.id} className="bg-neutral-900">{p.name}{p.builtIn ? " (Built-in)" : ""}</option>
-                    ))}
-                  </select>
-                  <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
-                </div>
-                {activeProfileId && (
-                  <span className="text-xs text-white/30">Adjusting sliders below will switch to manual mode</span>
-                )}
-              </div>
-
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                {([
-                  { id: 'left' as const, label: 'Left Trigger (L2)', state: leftTrigger },
-                  { id: 'right' as const, label: 'Right Trigger (R2)', state: rightTrigger },
-                ]).map((trigger) => (
-                  <div key={trigger.id} className="glass-panel p-8 rounded-3xl">
-                    <h3 className="text-2xl font-semibold mb-8 flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-xl bg-white/10 flex items-center justify-center text-sm font-bold">
-                        {trigger.id === 'left' ? 'L2' : 'R2'}
-                      </div>
-                      {trigger.label}
-                    </h3>
 
                     <div className="space-y-6">
-                      {/* Mode selector */}
                       <div>
-                        <label className="block text-sm font-medium text-white/70 mb-3">Effect Mode</label>
+                        <label className="block text-sm font-medium text-white/70 mb-2">Profile Name</label>
+                        <input
+                          type="text"
+                          value={lightingDraft.name}
+                          placeholder="My Neon Wave"
+                          onChange={(e) => updateLightingDraft((profile) => ({ ...profile, name: e.target.value, builtIn: false }))}
+                          className="w-full glass-input rounded-xl p-3 text-white outline-none font-medium placeholder:text-white/20"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-medium text-white/70 mb-2">Description</label>
+                        <textarea
+                          value={lightingDraft.description}
+                          placeholder="Describe when you like to use this lighting profile."
+                          onChange={(e) => updateLightingDraft((profile) => ({ ...profile, description: e.target.value, builtIn: false }))}
+                          className="w-full glass-input rounded-xl p-3 text-white outline-none font-medium placeholder:text-white/20 min-h-[88px] resize-y"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-medium text-white/70 mb-3">Effect Type</label>
                         <div className="relative">
                           <select
-                            value={trigger.state.mode}
-                            onChange={(e) => handleTriggerChange(trigger.id, 'mode', parseInt(e.target.value))}
+                            value={lightingDraft.effect}
+                            onChange={(e) => handleLightingEffectChange(e.target.value as LightingEffect)}
                             className="w-full glass-input rounded-xl p-4 text-white outline-none appearance-none font-medium"
                           >
-                            {Object.entries(MODE_LABELS).map(([v, l]) => (
-                              <option key={v} value={v} className="bg-neutral-900">{l}</option>
-                            ))}
+                            <option value="static" className="bg-neutral-900">Static</option>
+                            <option value="cycle" className="bg-neutral-900">Cycle</option>
+                            <option value="pulse" className="bg-neutral-900">Pulse</option>
+                            <option value="wave" className="bg-neutral-900">Wave</option>
                           </select>
                           <ChevronDown size={14} className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
                         </div>
                       </div>
 
-                      {trigger.state.mode !== 0 && (<>
-                        {/* Force */}
-                        <SliderRow label="Force / Amplitude" value={trigger.state.force} max={255} color="bg-purple-500"
-                          onChange={(v) => handleTriggerChange(trigger.id, 'force', v)} />
+                      <SliderRow
+                        label="Brightness"
+                        value={lightingDraft.brightness}
+                        max={100}
+                        color="bg-blue-500"
+                        onChange={(value) => updateLightingDraft((profile) => ({ ...profile, brightness: value }))}
+                      />
 
-                        {/* Start Position -- all active modes */}
-                        <SliderRow label="Start Position" value={trigger.state.startPos} max={255} color="bg-blue-500"
-                          onChange={(v) => handleTriggerChange(trigger.id, 'startPos', v)} />
-
-                        {/* End Position -- section + machine gun */}
-                        {(trigger.state.mode === 2 || trigger.state.mode === 39) && (
-                          <SliderRow label="End Position" value={trigger.state.endPos} max={255} color="bg-cyan-500"
-                            onChange={(v) => handleTriggerChange(trigger.id, 'endPos', v)} />
-                        )}
-
-                        {/* Frequency -- vibration + machine gun */}
-                        {(trigger.state.mode === 6 || trigger.state.mode === 39) && (
-                          <SliderRow label="Frequency (Hz)" value={trigger.state.frequency} max={255} color="bg-amber-500"
-                            onChange={(v) => handleTriggerChange(trigger.id, 'frequency', v)} />
-                        )}
-                      </>)}
+                      <SliderRow
+                        label="Animation Speed"
+                        value={lightingDraft.speed}
+                        max={100}
+                        color="bg-fuchsia-500"
+                        onChange={(value) => updateLightingDraft((profile) => ({ ...profile, speed: value }))}
+                      />
                     </div>
                   </div>
-                ))}
+
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="mb-6">
+                      <h3 className="text-lg font-semibold">Primary Color</h3>
+                      <p className="text-sm text-white/45 mt-1">
+                        Static profiles use this color directly. Animated profiles use it as the main tone.
+                      </p>
+                    </div>
+
+                    <div className="space-y-6">
+                      {[
+                        { label: "Red", color: "r" as const, value: lightingDraft.color.r, hex: "#ef4444" },
+                        { label: "Green", color: "g" as const, value: lightingDraft.color.g, hex: "#22c55e" },
+                        { label: "Blue", color: "b" as const, value: lightingDraft.color.b, hex: "#3b82f6" },
+                      ].map((channel) => (
+                        <div key={channel.color}>
+                          <div className="flex justify-between mb-3">
+                            <span className="font-medium" style={{ color: channel.hex }}>{channel.label}</span>
+                            <span className="text-white/50 font-mono bg-black/30 px-2 py-0.5 rounded-md text-sm">{channel.value}</span>
+                          </div>
+                          <div className="relative h-2 rounded-full bg-white/10">
+                            <div
+                              className="absolute top-0 left-0 h-full rounded-full"
+                              style={{ width: `${(channel.value / 255) * 100}%`, backgroundColor: channel.hex }}
+                            />
+                            <input
+                              type="range"
+                              min="0"
+                              max="255"
+                              value={channel.value}
+                              onChange={(e) => handleColorChange(channel.color, parseInt(e.target.value))}
+                              className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer"
+                            />
+                            <div
+                              className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full shadow-lg pointer-events-none"
+                              style={{ left: `calc(${(channel.value / 255) * 100}% - 8px)` }}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {usesAccentColor(lightingDraft.effect) && (
+                    <div className="glass-panel p-8 rounded-3xl">
+                      <div className="mb-6">
+                        <h3 className="text-lg font-semibold">Accent Color</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Pulse and wave profiles blend between the primary and accent colors.
+                        </p>
+                      </div>
+
+                      <div className="space-y-6">
+                        {[
+                          { label: "Red", color: "r" as const, value: lightingDraft.accentColor?.r ?? 0, hex: "#ef4444" },
+                          { label: "Green", color: "g" as const, value: lightingDraft.accentColor?.g ?? 0, hex: "#22c55e" },
+                          { label: "Blue", color: "b" as const, value: lightingDraft.accentColor?.b ?? 0, hex: "#3b82f6" },
+                        ].map((channel) => (
+                          <div key={channel.color}>
+                            <div className="flex justify-between mb-3">
+                              <span className="font-medium" style={{ color: channel.hex }}>{channel.label}</span>
+                              <span className="text-white/50 font-mono bg-black/30 px-2 py-0.5 rounded-md text-sm">{channel.value}</span>
+                            </div>
+                            <div className="relative h-2 rounded-full bg-white/10">
+                              <div
+                                className="absolute top-0 left-0 h-full rounded-full"
+                                style={{ width: `${(channel.value / 255) * 100}%`, backgroundColor: channel.hex }}
+                              />
+                              <input
+                                type="range"
+                                min="0"
+                                max="255"
+                                value={channel.value}
+                                onChange={(e) => handleAccentColorChange(channel.color, parseInt(e.target.value))}
+                                className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer"
+                              />
+                              <div
+                                className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full shadow-lg pointer-events-none"
+                                style={{ left: `calc(${(channel.value / 255) * 100}% - 8px)` }}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex items-start justify-between gap-4 mb-6">
+                      <div>
+                        <h3 className="text-lg font-semibold">Save And Apply</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Saved profiles can be re-applied from your library at any time.
+                        </p>
+                      </div>
+                      {activeLightingProfile && (
+                        <span className="text-xs uppercase tracking-[0.18em] text-emerald-300/70">
+                          Active: {activeLightingProfile.name}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4 mb-6">
+                      <div className="text-sm font-medium text-white/80 mb-2">Draft status</div>
+                      <p className="text-sm text-white/50 leading-relaxed">
+                        {isSavedLightingProfile
+                          ? "You are previewing a saved profile from your library."
+                          : isEditingCustomLightingProfile
+                            ? "You are editing a saved custom profile. Save to update it."
+                            : "You are working on an unsaved draft. Save it to add it to your custom lighting library."}
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap gap-3">
+                      <button
+                        onClick={saveLightingProfile}
+                        disabled={!lightingDraft.name.trim()}
+                        className="glass-button flex items-center gap-2 px-5 py-2.5 rounded-xl font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <Save size={18} />
+                        {isEditingCustomLightingProfile ? "Update Profile" : "Save Profile"}
+                      </button>
+                      <button
+                        onClick={startNewLightingProfile}
+                        className="glass-button flex items-center gap-2 px-5 py-2.5 rounded-xl font-medium text-white/70"
+                      >
+                        <Plus size={18} /> Start Fresh
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === "haptics" && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4 mb-8">
+                <div>
+                  <h2 className="text-4xl font-bold mb-2">Haptics</h2>
+                  <p className="text-white/50 max-w-3xl">
+                    Browse built-in haptic presets, tune each trigger live, and save your own custom haptic setups.
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => setLinkTriggerEditing((current) => !current)}
+                    className={`px-4 py-2 rounded-xl text-sm font-medium transition-colors ${
+                      linkTriggerEditing ? "bg-purple-600 text-white" : "glass-button text-white/60"
+                    }`}
+                  >
+                    {linkTriggerEditing ? "Linked Editing" : "Edit Separately"}
+                  </button>
+                  <button onClick={startNewHapticProfile} className="glass-button flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium">
+                    <Plus size={16} /> New Haptic Profile
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.1fr)_minmax(380px,0.95fr)] gap-6">
+                <div className="space-y-6">
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex items-start justify-between gap-4 mb-6">
+                      <div>
+                        <h3 className="text-xl font-semibold">Haptic Library</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Built-ins cover the supported trigger effect families, and custom profiles let you save your own feel.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-6">
+                      <div>
+                        <div className="text-xs uppercase tracking-[0.18em] text-white/30 mb-3">Built-in</div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {BUILTIN_HAPTIC_PROFILES.map((profile) => (
+                            <div
+                              key={profile.id}
+                              className={`text-left rounded-2xl border p-4 transition-all duration-200 ${
+                                activeProfileId === profile.id
+                                  ? "border-purple-400/40 bg-purple-500/10 shadow-[0_0_0_1px_rgba(192,132,252,0.2)]"
+                                  : "border-white/8 bg-white/[0.03] hover:border-white/20 hover:bg-white/[0.05]"
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-4 mb-3">
+                                <div>
+                                  <div className="font-semibold text-white">{profile.name}</div>
+                                  <div className="mt-1 text-xs uppercase tracking-[0.18em] text-white/35">{profile.category}</div>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => loadHapticProfileForEditing(profile)}
+                                  className="p-2 hover:bg-white/10 rounded-lg transition-colors text-white/40 hover:text-white"
+                                  title="Duplicate into custom"
+                                >
+                                  <Pencil size={14} />
+                                </button>
+                              </div>
+                              <button type="button" onClick={() => applyHapticProfile(profile)} className="w-full text-left">
+                              <p className="text-sm text-white/55 leading-relaxed mb-3">{profile.description}</p>
+                              <div className="text-xs text-white/35">
+                                L2: {describeTriggerEffect(profile.left)}<br />
+                                R2: {describeTriggerEffect(profile.right)}
+                              </div>
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="text-xs uppercase tracking-[0.18em] text-white/30 mb-3">Custom</div>
+                        <div className="space-y-3">
+                          {customHapticProfiles.map((profile) => (
+                            <div
+                              key={profile.id}
+                              className={`rounded-2xl border p-4 transition-colors ${
+                                activeProfileId === profile.id
+                                  ? "border-fuchsia-400/40 bg-fuchsia-500/10"
+                                  : "border-white/8 bg-white/[0.03]"
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-4">
+                                <button type="button" onClick={() => applyHapticProfile(profile)} className="flex-1 text-left">
+                                  <div className="font-semibold text-white">{profile.name}</div>
+                                  <div className="mt-1 text-xs uppercase tracking-[0.18em] text-white/35">{profile.category}</div>
+                                  <p className="mt-2 text-sm text-white/50">{profile.description || "Custom haptic profile"}</p>
+                                </button>
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => loadHapticProfileForEditing(profile)}
+                                    className="p-2 hover:bg-white/10 rounded-lg transition-colors text-white/40 hover:text-white"
+                                    title="Edit"
+                                  >
+                                    <Pencil size={14} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => deleteHapticProfile(profile.id)}
+                                    className="p-2 hover:bg-red-500/20 rounded-lg transition-colors text-white/40 hover:text-red-400"
+                                    title="Delete"
+                                  >
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                          {customHapticProfiles.length === 0 && (
+                            <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.02] p-6 text-sm text-white/35">
+                              No custom haptic profiles yet. Duplicate a built-in or create a new setup from the live editor.
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex flex-wrap items-center gap-3 mb-6">
+                      <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-sm text-white/70">
+                        Active: <span className="text-white font-medium">{activeHapticProfile?.name ?? "Manual / Unsaved"}</span>
+                      </span>
+                      {adaptiveTriggers.enabled && (
+                        <span className="px-3 py-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-sm text-cyan-200">
+                          Adaptive Triggers are currently overriding live output
+                        </span>
+                      )}
+                      <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-sm text-white/50">
+                        L2: <span className="text-white/80">{getTriggerEffectDefinition(leftTrigger.kind).label}</span>
+                      </span>
+                      <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-sm text-white/50">
+                        R2: <span className="text-white/80">{getTriggerEffectDefinition(rightTrigger.kind).label}</span>
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {([
+                        { id: "left" as const, title: "L2", effect: leftTrigger },
+                        { id: "right" as const, title: "R2", effect: rightTrigger },
+                      ]).map((trigger) => (
+                        <div key={trigger.id} className="rounded-2xl border border-white/8 bg-white/[0.03] p-5">
+                          <div className="text-sm font-semibold text-white/80 mb-2">{trigger.title}</div>
+                          <div className="text-xs text-white/40">{describeTriggerEffect(trigger.effect)}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-6">
+                  {([
+                    { id: "left" as const, label: "Left Trigger (L2)", effect: leftTrigger },
+                    { id: "right" as const, label: "Right Trigger (R2)", effect: rightTrigger },
+                  ]).map((trigger) => {
+                    const definition = getTriggerEffectDefinition(trigger.effect.kind);
+                    return (
+                      <div key={trigger.id} className="glass-panel p-8 rounded-3xl">
+                        <div className="flex items-start justify-between gap-4 mb-6">
+                          <div>
+                            <h3 className="text-2xl font-semibold mb-2">{trigger.label}</h3>
+                            <p className="text-sm text-white/45">{definition.description}</p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => resetTriggerSide(trigger.id)}
+                              className="glass-button px-3 py-2 rounded-xl text-xs font-medium text-white/60"
+                            >
+                              Reset
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => copyTriggerSide(trigger.id, trigger.id === "left" ? "right" : "left")}
+                              className="glass-button px-3 py-2 rounded-xl text-xs font-medium text-white/60"
+                            >
+                              Copy To {trigger.id === "left" ? "R2" : "L2"}
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="space-y-6">
+                          <div>
+                            <label className="block text-sm font-medium text-white/70 mb-3">Effect Type</label>
+                            <div className="relative">
+                              <select
+                                value={trigger.effect.kind}
+                                onChange={(e) => applyTriggerEffectKind(trigger.id, e.target.value as TriggerEffectKind)}
+                                className="w-full glass-input rounded-xl p-4 text-white outline-none appearance-none font-medium"
+                              >
+                                {TRIGGER_EFFECT_DEFINITIONS.map((effectDefinition) => (
+                                  <option key={effectDefinition.kind} value={effectDefinition.kind} className="bg-neutral-900">
+                                    {effectDefinition.label}
+                                  </option>
+                                ))}
+                              </select>
+                              <ChevronDown size={14} className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
+                            </div>
+                          </div>
+
+                          {definition.fields.includes("force") && (
+                            <SliderRow
+                              label="Force / Amplitude"
+                              value={trigger.effect.force ?? 0}
+                              max={255}
+                              color="bg-purple-500"
+                              onChange={(value) => updateTriggerNumericField(trigger.id, "force", value)}
+                            />
+                          )}
+                          {definition.fields.includes("startPosition") && (
+                            <SliderRow
+                              label="Start Position"
+                              value={trigger.effect.startPosition ?? 0}
+                              max={255}
+                              color="bg-blue-500"
+                              onChange={(value) => updateTriggerNumericField(trigger.id, "startPosition", value)}
+                            />
+                          )}
+                          {definition.fields.includes("endPosition") && (
+                            <SliderRow
+                              label="End Position"
+                              value={trigger.effect.endPosition ?? 180}
+                              max={255}
+                              color="bg-cyan-500"
+                              onChange={(value) => updateTriggerNumericField(trigger.id, "endPosition", value)}
+                            />
+                          )}
+                          {definition.fields.includes("frequency") && (
+                            <SliderRow
+                              label="Frequency"
+                              value={trigger.effect.frequency ?? 30}
+                              max={255}
+                              color="bg-amber-500"
+                              onChange={(value) => updateTriggerNumericField(trigger.id, "frequency", value)}
+                            />
+                          )}
+                          {definition.fields.includes("rawMode") && (
+                            <SliderRow
+                              label="Raw Mode"
+                              value={trigger.effect.rawMode ?? 0}
+                              max={255}
+                              color="bg-rose-500"
+                              onChange={(value) => updateTriggerNumericField(trigger.id, "rawMode", value)}
+                            />
+                          )}
+                          {definition.fields.includes("rawParams") && (
+                            <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
+                              <div className="text-sm font-medium text-white/80 mb-4">Expert Payload Bytes</div>
+                              <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                                {(trigger.effect.rawParams ?? Array(10).fill(0)).map((value, index) => (
+                                  <div key={index}>
+                                    <label className="block text-xs text-white/40 mb-2">P{index}</label>
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      max="255"
+                                      value={value}
+                                      onChange={(event) => updateTriggerRawParam(trigger.id, index, parseInt(event.target.value || "0"))}
+                                      className="w-full glass-input rounded-lg p-3 text-white text-sm outline-none font-medium"
+                                    />
+                                  </div>
+                                ))}
+                              </div>
+                              <p className="text-xs text-amber-200/70 mt-4">
+                                Expert Raw writes the payload bytes directly and skips the validated effect encoder for this trigger.
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex items-start justify-between gap-4 mb-6">
+                      <div>
+                        <h3 className="text-lg font-semibold">Save Current Setup</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Save the current trigger setup as a reusable custom profile, or update an existing custom profile.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      <div>
+                        <label className="block text-sm font-medium text-white/70 mb-2">Profile Name</label>
+                        <input
+                          type="text"
+                          value={editingHapticProfile?.name ?? ""}
+                          placeholder="My Trigger Profile"
+                          onChange={(e) => setEditingHapticProfile((current) => ({
+                            ...(current ?? createHapticProfileDraft(leftTrigger, rightTrigger)),
+                            name: e.target.value,
+                          }))}
+                          className="w-full glass-input rounded-xl p-3 text-white outline-none font-medium placeholder:text-white/20"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-white/70 mb-2">Category</label>
+                        <input
+                          type="text"
+                          value={editingHapticProfile?.category ?? "Custom"}
+                          placeholder="FPS, Racing, Action..."
+                          onChange={(e) => setEditingHapticProfile((current) => ({
+                            ...(current ?? createHapticProfileDraft(leftTrigger, rightTrigger)),
+                            category: e.target.value,
+                          }))}
+                          className="w-full glass-input rounded-xl p-3 text-white outline-none font-medium placeholder:text-white/20"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-white/70 mb-2">Description</label>
+                        <textarea
+                          value={editingHapticProfile?.description ?? ""}
+                          placeholder="Describe how this haptic profile feels in-game."
+                          onChange={(e) => setEditingHapticProfile((current) => ({
+                            ...(current ?? createHapticProfileDraft(leftTrigger, rightTrigger)),
+                            description: e.target.value,
+                          }))}
+                          className="w-full glass-input rounded-xl p-3 text-white outline-none font-medium placeholder:text-white/20 min-h-[92px] resize-y"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap gap-3 mt-6">
+                      <button
+                        onClick={() => editingHapticProfile && saveHapticProfile({
+                          ...editingHapticProfile,
+                          left: cloneTriggerEffect(leftTrigger),
+                          right: cloneTriggerEffect(rightTrigger),
+                        })}
+                        disabled={!editingHapticProfile?.name.trim()}
+                        className="bg-purple-600 hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed px-5 py-2.5 rounded-xl text-sm font-medium transition-colors"
+                      >
+                        {editingHapticProfile && customHapticProfiles.some((profile) => profile.id === editingHapticProfile.id)
+                          ? "Update Profile"
+                          : "Save Profile"}
+                      </button>
+                      <button
+                        onClick={() => setEditingHapticProfile(null)}
+                        className="glass-button px-5 py-2.5 rounded-xl text-sm font-medium text-white/50"
+                      >
+                        Clear Draft
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === "adaptiveTriggers" && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4 mb-8">
+                <div>
+                  <h2 className="text-4xl font-bold mb-2">Adaptive Triggers</h2>
+                  <p className="text-white/50 max-w-3xl">
+                    Build game-specific trigger behavior driven by a demo slider or live OCR telemetry from racing games.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => updateAdaptiveTriggerSettings((current) => ({ ...current, enabled: !current.enabled }))}
+                  className={`px-5 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                    adaptiveTriggers.enabled ? "bg-cyan-500 text-slate-950" : "glass-button text-white/70"
+                  }`}
+                >
+                  {adaptiveTriggers.enabled ? "Adaptive Output Enabled" : "Adaptive Output Disabled"}
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,0.95fr)_minmax(420px,1.05fr)] gap-6">
+                <div className="space-y-6">
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex items-start justify-between gap-4 mb-6">
+                      <div>
+                        <h3 className="text-xl font-semibold">Game Profile</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Switch between demo and live OCR input while keeping the same high-speed trigger policy for racing games.
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] p-1">
+                        <button
+                          type="button"
+                          onClick={() => updateAdaptiveTriggerSettings((current) => ({ ...current, inputSource: "demo" }))}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                            adaptiveTriggers.inputSource === "demo" ? "bg-white text-black" : "text-white/60"
+                          }`}
+                        >
+                          Demo
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => updateAdaptiveTriggerSettings((current) => ({ ...current, inputSource: "live" }))}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                            adaptiveTriggers.inputSource === "live" ? "bg-cyan-500 text-slate-950" : "text-white/60"
+                          }`}
+                        >
+                          Live
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-6">
+                      <div>
+                        <label className="block text-sm font-medium text-white/70 mb-3">Target Game</label>
+                        <div className="relative">
+                          <select
+                            value={adaptiveTriggers.selectedGame}
+                            onChange={(e) => updateAdaptiveTriggerSettings((current) => ({
+                              ...current,
+                              selectedGame: e.target.value === "nfsHeat" ? "nfsHeat" : current.selectedGame,
+                            }))}
+                            className="w-full glass-input rounded-xl p-4 text-white outline-none appearance-none font-medium"
+                          >
+                            <option value="nfsHeat" className="bg-neutral-900">Racing Games</option>
+                          </select>
+                          <ChevronDown size={14} className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
+                        </div>
+                      </div>
+
+                      {adaptiveTriggers.inputSource === "live" && (
+                        <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-5 space-y-4">
+                          <div className="flex items-start justify-between gap-4">
+                            <div>
+                              <div className="text-sm font-medium text-white/80">OCR Process Monitoring</div>
+                              <p className="text-sm text-white/45 mt-1">
+                                WinSense will first try to auto-detect a likely racing game. If none is active, choose any visible process window to monitor with OCR.
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => void loadOcrProcessOptions()}
+                              disabled={ocrProcessOptionsLoading}
+                              className="px-3 py-2 rounded-xl text-xs font-medium glass-button disabled:opacity-60"
+                            >
+                              {ocrProcessOptionsLoading ? "Refreshing..." : "Refresh Processes"}
+                            </button>
+                          </div>
+                          <div className="relative">
+                            <select
+                              value={manualOcrProcessName ?? ""}
+                              onChange={(event) => updateNfsHeatAdaptiveSettings({
+                                ocrProcessName: event.target.value.trim() ? event.target.value : null,
+                              })}
+                              className="w-full glass-input rounded-xl p-4 text-white outline-none appearance-none font-medium"
+                            >
+                              <option value="" className="bg-neutral-900">Automatic racing-game detection</option>
+                              {ocrProcessOptions.map((process) => (
+                                <option
+                                  key={`${process.processId}-${process.processName}`}
+                                  value={process.processName}
+                                  className="bg-neutral-900"
+                                >
+                                  {process.processName}
+                                  {process.windowTitle ? ` - ${process.windowTitle}` : ""}
+                                  {process.likelyRacing ? " [Likely Racing]" : ""}
+                                </option>
+                              ))}
+                            </select>
+                            <ChevronDown size={14} className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
+                          </div>
+                          <p className="text-xs text-white/45">
+                            {manualOcrProcessName
+                              ? `Manual fallback selected: ${manualOcrProcessName}. Auto-detect still takes priority if a likely racing game is already visible.`
+                              : "No manual process selected. WinSense will wait for auto-detected racing games only."}
+                          </p>
+                        </div>
+                      )}
+
+                      <div className={`rounded-2xl border p-5 ${adaptiveStatusTone}`}>
+                        <div className="flex flex-wrap items-center gap-3 mb-3">
+                          <span className="px-3 py-1.5 rounded-full bg-black/10 border border-white/10 text-sm">
+                            Source: <span className="font-medium">{adaptiveTriggers.inputSource === "live" ? "Live OCR" : "Demo Slider"}</span>
+                          </span>
+                          <span className="px-3 py-1.5 rounded-full bg-black/10 border border-white/10 text-sm">
+                            Status: <span className="font-medium">{gameTelemetryStatus.stage}</span>
+                          </span>
+                          <span className="px-3 py-1.5 rounded-full bg-black/10 border border-white/10 text-sm">
+                            OCR Calibration: <span className="font-medium">{ocrCalibrationReady ? "Ready" : "Missing"}</span>
+                          </span>
+                          <span className="px-3 py-1.5 rounded-full bg-black/10 border border-white/10 text-sm">
+                            Active Speed: <span className="font-medium">{adaptiveActiveSpeedKph ?? 0} km/h</span>
+                          </span>
+                          <span className="px-3 py-1.5 rounded-full bg-black/10 border border-white/10 text-sm">
+                            Speed Strength: <span className="font-medium">{adaptiveStrengthPercent}%</span>
+                          </span>
+                        </div>
+                        <p className="text-sm text-white/50 leading-relaxed">
+                          {gameTelemetryStatus.message}
+                        </p>
+                        {gameTelemetryStatus.processId && (
+                          <p className="text-xs text-white/45 mt-3">Detected process ID: {gameTelemetryStatus.processId}</p>
+                        )}
+                        {gameTelemetryStatus.lastSpeedAtUnixMs && (
+                          <p className="text-xs text-white/45 mt-1">
+                            Last live update: {new Date(gameTelemetryStatus.lastSpeedAtUnixMs).toLocaleTimeString()}
+                          </p>
+                        )}
+                      </div>
+
+                      <SliderRow
+                        label={adaptiveTriggers.inputSource === "live" ? "Fallback Demo Speed (km/h)" : "Demo Speed (km/h)"}
+                        value={adaptiveTriggers.nfsHeat.demoSpeedKph}
+                        max={999}
+                        color="bg-cyan-500"
+                        onChange={(value) => updateNfsHeatAdaptiveSettings({ demoSpeedKph: value })}
+                      />
+                      {adaptiveTriggers.inputSource === "live" && (
+                        <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 -mt-2 space-y-3">
+                          <p className="text-sm text-white/45">
+                            Demo speed remains available as a fallback while WinSense is waiting for a live OCR read from the selected racing-game HUD.
+                          </p>
+                          <div className="flex flex-wrap items-center gap-3">
+                            <button
+                              type="button"
+                              onClick={() => void loadOcrCalibrationPreview()}
+                              disabled={ocrCalibrationLoading}
+                              className="px-4 py-2 rounded-xl text-sm font-medium bg-cyan-500 text-slate-950 disabled:opacity-60"
+                            >
+                              {ocrCalibrationLoading ? "Capturing Preview..." : ocrCalibrationReady ? "Recalibrate OCR Region" : "Calibrate OCR Region"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={resetOcrCalibration}
+                              disabled={!ocrCalibrationReady}
+                              className="px-4 py-2 rounded-xl text-sm font-medium glass-button disabled:opacity-50"
+                            >
+                              Reset Calibration
+                            </button>
+                          </div>
+                          {ocrCalibrationReady && adaptiveTriggers.nfsHeat.ocrCalibration && (
+                            <p className="text-xs text-white/45">
+                              Saved crop: {adaptiveTriggers.nfsHeat.ocrCalibration.width} x {adaptiveTriggers.nfsHeat.ocrCalibration.height} inside a
+                              {" "}
+                              {adaptiveTriggers.nfsHeat.ocrCalibration.referenceWidth} x {adaptiveTriggers.nfsHeat.ocrCalibration.referenceHeight}
+                              {" "}
+                              game-window preview.
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex items-start justify-between gap-4 mb-6">
+                      <div>
+                        <h3 className="text-xl font-semibold">Live Preview</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Preview the exact trigger effects currently being generated for the active speed source.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-5">
+                        <div className="text-sm font-semibold text-white/80 mb-2">L2 Brake</div>
+                        <div className="text-xs text-white/35 mb-3">High-speed braking gets firmer and spans a wider resistance band.</div>
+                        <div className="text-sm text-white/70">{describeTriggerEffect(adaptivePreview.left)}</div>
+                      </div>
+                      <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-5">
+                        <div className="text-sm font-semibold text-white/80 mb-2">R2 Throttle</div>
+                        <div className="text-xs text-white/35 mb-3">Throttle tension increases as vehicle speed rises.</div>
+                        <div className="text-sm text-white/70">{describeTriggerEffect(adaptivePreview.right)}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-6">
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex items-start justify-between gap-4 mb-6">
+                      <div>
+                        <h3 className="text-xl font-semibold">Speed Range</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Define how quickly the haptics ramp from cruising to top-speed resistance.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-6">
+                      <SliderRow
+                        label="Minimum Speed (km/h)"
+                        value={adaptiveTriggers.nfsHeat.minSpeedKph}
+                        max={998}
+                        color="bg-blue-500"
+                        onChange={(value) => updateNfsHeatAdaptiveSettings({ minSpeedKph: value })}
+                      />
+                      <SliderRow
+                        label="Maximum Speed (km/h)"
+                        value={adaptiveTriggers.nfsHeat.maxSpeedKph}
+                        max={999}
+                        color="bg-fuchsia-500"
+                        onChange={(value) => updateNfsHeatAdaptiveSettings({ maxSpeedKph: value })}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex items-start justify-between gap-4 mb-6">
+                      <div>
+                        <h3 className="text-xl font-semibold">Brake Tuning</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Tune the L2 resistance band used to mimic heavier braking at higher speed.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-6">
+                      <SliderRow
+                        label="Brake Start Position"
+                        value={adaptiveTriggers.nfsHeat.brakeStartPosition}
+                        max={255}
+                        color="bg-amber-500"
+                        onChange={(value) => updateNfsHeatAdaptiveSettings({ brakeStartPosition: value })}
+                      />
+                      <SliderRow
+                        label="Brake End Position"
+                        value={adaptiveTriggers.nfsHeat.brakeEndPosition}
+                        max={255}
+                        color="bg-orange-500"
+                        onChange={(value) => updateNfsHeatAdaptiveSettings({ brakeEndPosition: value })}
+                      />
+                      <SliderRow
+                        label="Brake Minimum Force"
+                        value={adaptiveTriggers.nfsHeat.brakeMinForce}
+                        max={255}
+                        color="bg-red-400"
+                        onChange={(value) => updateNfsHeatAdaptiveSettings({ brakeMinForce: value })}
+                      />
+                      <SliderRow
+                        label="Brake Maximum Force"
+                        value={adaptiveTriggers.nfsHeat.brakeMaxForce}
+                        max={255}
+                        color="bg-red-500"
+                        onChange={(value) => updateNfsHeatAdaptiveSettings({ brakeMaxForce: value })}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="glass-panel p-8 rounded-3xl">
+                    <div className="flex items-start justify-between gap-4 mb-6">
+                      <div>
+                        <h3 className="text-xl font-semibold">Throttle Tuning</h3>
+                        <p className="text-sm text-white/45 mt-1">
+                          Tune the R2 resistance curve used to make throttle feel firmer as speed builds.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-6">
+                      <SliderRow
+                        label="Throttle Start Position"
+                        value={adaptiveTriggers.nfsHeat.throttleStartPosition}
+                        max={255}
+                        color="bg-emerald-400"
+                        onChange={(value) => updateNfsHeatAdaptiveSettings({ throttleStartPosition: value })}
+                      />
+                      <SliderRow
+                        label="Throttle Minimum Force"
+                        value={adaptiveTriggers.nfsHeat.throttleMinForce}
+                        max={255}
+                        color="bg-emerald-500"
+                        onChange={(value) => updateNfsHeatAdaptiveSettings({ throttleMinForce: value })}
+                      />
+                      <SliderRow
+                        label="Throttle Maximum Force"
+                        value={adaptiveTriggers.nfsHeat.throttleMaxForce}
+                        max={255}
+                        color="bg-teal-500"
+                        onChange={(value) => updateNfsHeatAdaptiveSettings({ throttleMaxForce: value })}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === "audio" && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="flex justify-between items-end mb-10">
+                <div>
+                  <h2 className="text-4xl font-bold mb-2">Audio</h2>
+                  <p className="text-white/50">Control and test the controller's speaker and microphone.</p>
+                </div>
+                <button
+                  onClick={() => handleAudioChange("audioMute", !audioSettings.audioMute)}
+                  className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-medium transition-colors ${audioSettings.audioMute ? 'bg-red-600/80 text-white' : 'glass-button text-white/50'}`}
+                >
+                  {audioSettings.audioMute ? <VolumeX size={18} /> : <Volume2 size={18} />}
+                  {audioSettings.audioMute ? 'Muted' : 'Audio On'}
+                </button>
+              </div>
+
+              <div className={`space-y-6 max-w-2xl transition-opacity duration-300 ${audioSettings.audioMute ? 'opacity-50 pointer-events-none' : ''}`}>
+                <div className="glass-panel p-8 rounded-3xl">
+                  <div className="flex items-center gap-3 mb-6">
+                    <Speaker size={20} className="text-blue-400" />
+                    <h3 className="text-lg font-semibold">Speaker</h3>
+                  </div>
+                  <div className="space-y-6">
+                    <div>
+                      <div className="flex justify-between mb-3">
+                        <span className="font-medium text-white/80">Speaker Volume</span>
+                        <span className="text-white/50 font-mono bg-black/30 px-2 py-0.5 rounded-md text-sm">{audioSettings.speakerVolume}%</span>
+                      </div>
+                      <div className="relative h-2 rounded-full bg-white/10">
+                        <div className="absolute top-0 left-0 h-full rounded-full bg-blue-500" style={{ width: `${audioSettings.speakerVolume}%` }}></div>
+                        <input type="range" min="0" max="100" value={audioSettings.speakerVolume} onChange={(e) => handleAudioChange("speakerVolume", parseInt(e.target.value))} className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer" />
+                        <div className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full shadow-lg pointer-events-none" style={{ left: `calc(${audioSettings.speakerVolume}% - 8px)` }}></div>
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="flex justify-between mb-3">
+                        <span className="font-medium text-white/80">Headphone Volume</span>
+                        <span className="text-white/50 font-mono bg-black/30 px-2 py-0.5 rounded-md text-sm">{audioSettings.headphoneVolume}%</span>
+                      </div>
+                      <div className="relative h-2 rounded-full bg-white/10">
+                        <div className="absolute top-0 left-0 h-full rounded-full bg-purple-500" style={{ width: `${audioSettings.headphoneVolume}%` }}></div>
+                        <input type="range" min="0" max="100" value={audioSettings.headphoneVolume} onChange={(e) => handleAudioChange("headphoneVolume", parseInt(e.target.value))} className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer" />
+                        <div className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full shadow-lg pointer-events-none" style={{ left: `calc(${audioSettings.headphoneVolume}% - 8px)` }}></div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between pt-2">
+                      <div>
+                        <span className="font-medium text-white/80">Enable Internal Speaker</span>
+                        <p className="text-sm text-white/40 mt-0.5">Route audio to the built-in speaker alongside a connected headset.</p>
+                      </div>
+                      <button
+                        onClick={() => handleAudioChange("forceInternalSpeaker", !audioSettings.forceInternalSpeaker)}
+                        className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${audioSettings.forceInternalSpeaker ? 'bg-blue-600' : 'bg-white/20'}`}
+                      >
+                        <div className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${audioSettings.forceInternalSpeaker ? 'translate-x-5' : ''}`}></div>
+                      </button>
+                    </div>
+
+                    <div className="pt-2">
+                      {bluetoothAudioExperimental && (
+                        <div className="flex items-start gap-3 bg-cyan-500/10 border border-cyan-500/20 rounded-xl p-4 mb-4">
+                          <Info size={18} className="text-cyan-300 mt-0.5 shrink-0" />
+                          <p className="text-sm text-cyan-100/80">
+                            Bluetooth speaker playback is experimental and streams an in-app test tone over the controller HID link rather than a Windows audio device.
+                          </p>
+                        </div>
+                      )}
+                      <p className="text-sm text-white/40 mb-3">
+                        Plays a boosted test tone through the controller speaker and temporarily enables internal speaker routing if needed.
+                      </p>
+                      <button
+                        onClick={() => void handleTestSpeaker()}
+                        disabled={!speakerTestSupported || speakerTestActive}
+                        className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-medium transition-colors ${
+                          !speakerTestSupported
+                            ? 'glass-button opacity-50 cursor-not-allowed'
+                            : speakerTestActive
+                              ? 'bg-blue-600/60 text-white cursor-not-allowed'
+                              : 'glass-button'
+                        }`}
+                      >
+                        {speakerTestActive ? <Loader2 size={18} className="animate-spin" /> : <Zap size={18} />}
+                        {speakerTestActive
+                          ? 'Playing...'
+                          : speakerTestSupported
+                            ? bluetoothAudioExperimental
+                              ? 'Run Bluetooth Speaker Test'
+                              : 'Test Speaker'
+                            : `Unavailable (${transportLabel})`}
+                      </button>
+                      {speakerTestError && (
+                        <p className="mt-3 text-sm text-red-400">{speakerTestError}</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="glass-panel p-8 rounded-3xl">
+                  <div className="flex items-center gap-3 mb-6">
+                    <Mic size={20} className="text-green-400" />
+                    <h3 className="text-lg font-semibold">Microphone</h3>
+                  </div>
+                  <div className="space-y-6">
+                    <div>
+                      <div className="flex justify-between mb-3">
+                        <span className="font-medium text-white/80">Microphone Volume</span>
+                        <span className="text-white/50 font-mono bg-black/30 px-2 py-0.5 rounded-md text-sm">{audioSettings.micVolume}%</span>
+                      </div>
+                      <div className="relative h-2 rounded-full bg-white/10">
+                        <div className="absolute top-0 left-0 h-full rounded-full bg-green-500" style={{ width: `${audioSettings.micVolume}%` }}></div>
+                        <input type="range" min="0" max="100" value={audioSettings.micVolume} onChange={(e) => handleAudioChange("micVolume", parseInt(e.target.value))} className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer" />
+                        <div className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full shadow-lg pointer-events-none" style={{ left: `calc(${audioSettings.micVolume}% - 8px)` }}></div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between pt-2">
+                      <div>
+                        <span className="font-medium text-white/80">Mute Microphone</span>
+                        <p className="text-sm text-white/40 mt-0.5">Hardware-mute the controller microphone.</p>
+                      </div>
+                      <button
+                        onClick={() => handleAudioChange("micMute", !audioSettings.micMute)}
+                        className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${audioSettings.micMute ? 'bg-red-600' : 'bg-white/20'}`}
+                      >
+                        <div className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${audioSettings.micMute ? 'translate-x-5' : ''}`}></div>
+                      </button>
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <span className="font-medium text-white/80">Mute Button LED</span>
+                        <p className="text-sm text-white/40 mt-0.5">Control the mute indicator light on the controller.</p>
+                      </div>
+                      <div className="relative min-w-[140px]">
+                        <select
+                          value={audioSettings.micMuteLed}
+                          onChange={(e) => handleAudioChange("micMuteLed", parseInt(e.target.value))}
+                          className="w-full glass-input rounded-xl p-3 text-white outline-none appearance-none font-medium text-sm"
+                        >
+                          <option value={0} className="bg-neutral-900">Off</option>
+                          <option value={1} className="bg-neutral-900">On</option>
+                          <option value={2} className="bg-neutral-900">Breathing</option>
+                        </select>
+                        <ChevronDown size={16} className="absolute right-3 top-1/2 -translate-y-1/2 text-white/40 pointer-events-none" />
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <span className="font-medium text-white/80">Force Internal Mic</span>
+                        <p className="text-sm text-white/40 mt-0.5">Always use the controller's built-in microphone, even when a headset is connected.</p>
+                      </div>
+                      <button
+                        onClick={() => handleAudioChange("forceInternalMic", !audioSettings.forceInternalMic)}
+                        className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${audioSettings.forceInternalMic ? 'bg-green-600' : 'bg-white/20'}`}
+                      >
+                        <div className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${audioSettings.forceInternalMic ? 'translate-x-5' : ''}`}></div>
+                      </button>
+                    </div>
+
+                    <div className="pt-2 space-y-3">
+                      {bluetoothAudioExperimental && (
+                        <div className="flex items-start gap-3 bg-cyan-500/10 border border-cyan-500/20 rounded-xl p-4">
+                          <Info size={18} className="text-cyan-300 mt-0.5 shrink-0" />
+                          <p className="text-sm text-cyan-100/80">
+                            Bluetooth mic monitoring is experimental. WinSense probes Bluetooth HID traffic first, then uses the controller mic if Windows exposes it.
+                          </p>
+                        </div>
+                      )}
+                      <p className="text-sm text-white/40">Routes the controller's mic audio to your default speakers so you can hear yourself in real time.</p>
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={handleMicTest}
+                          disabled={!micTestSupported}
+                          className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-medium transition-colors ${
+                            !micTestSupported
+                              ? 'glass-button opacity-50 cursor-not-allowed'
+                              : micTestActive
+                                ? 'bg-red-600/80 text-white'
+                                : 'glass-button'
+                          }`}
+                        >
+                          {micTestActive ? <MicOff size={18} /> : <Mic size={18} />}
+                          {micTestActive ? 'Stop Listening' : 'Start Listening'}
+                        </button>
+                        {micTestActive && (
+                          <span className="flex items-center gap-2 text-sm text-green-400">
+                            <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
+                            Mic active
+                          </span>
+                        )}
+                      </div>
+                      {micTestError && (
+                        <p className="text-sm text-red-400">{micTestError}</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -1579,244 +3286,50 @@ function App() {
                   </div>
                 </div>
 
-                {/* Haptic Profiles section */}
                 <div className="glass-panel p-8 rounded-3xl">
-                  <div className="flex items-center justify-between mb-6">
-                    <div className="flex items-center gap-3">
-                      <div className="p-3 rounded-xl bg-purple-500/10 border border-purple-500/20">
-                        <Sliders size={20} className="text-purple-400" />
-                      </div>
-                      <div>
-                        <h3 className="text-lg font-semibold">Haptic Profiles</h3>
-                        <p className="text-white/50 text-sm">Create and manage custom adaptive trigger presets.</p>
-                      </div>
+                  <div className="flex items-start gap-4">
+                    <div className="p-3 rounded-xl bg-purple-500/10 border border-purple-500/20 mt-0.5">
+                      <Sliders size={20} className="text-purple-400" />
                     </div>
-                    <button
-                      onClick={() => setEditingProfile({
-                        id: generateId(), name: "", builtIn: false,
-                        left: { ...DEFAULT_TRIGGER }, right: { ...DEFAULT_TRIGGER },
-                      })}
-                      className="glass-button flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium"
-                    >
-                      <Plus size={16} /> New Profile
-                    </button>
-                  </div>
-
-                  {/* Profile list */}
-                  <div className="space-y-3 mb-2">
-                    {hapticProfiles.map(p => (
-                      <div key={p.id} className={`flex items-center justify-between p-4 rounded-xl border transition-colors ${
-                        activeProfileId === p.id ? 'bg-purple-500/10 border-purple-500/20' : 'bg-white/[0.03] border-white/5'
-                      }`}>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="font-medium truncate">{p.name}</span>
-                            {p.builtIn && <span className="text-[10px] uppercase tracking-wider text-white/30 bg-white/5 px-1.5 py-0.5 rounded">Built-in</span>}
-                          </div>
-                          <div className="text-xs text-white/40 mt-1">
-                            L2: {MODE_LABELS[p.left.mode] ?? "Off"} &middot; R2: {MODE_LABELS[p.right.mode] ?? "Off"}
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-1.5 ml-4">
-                          <button onClick={() => setEditingProfile({ ...p, left: { ...p.left }, right: { ...p.right } })}
-                            className="p-2 hover:bg-white/10 rounded-lg transition-colors text-white/40 hover:text-white" title="Edit">
-                            <Pencil size={14} />
-                          </button>
-                          {!p.builtIn && (
-                            <button onClick={() => deleteHapticProfile(p.id)}
-                              className="p-2 hover:bg-red-500/20 rounded-lg transition-colors text-white/40 hover:text-red-400" title="Delete">
-                              <Trash2 size={14} />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                    {hapticProfiles.length === 0 && (
-                      <div className="text-center py-8 text-white/30 text-sm">No profiles yet. Click "New Profile" to create one.</div>
-                    )}
-                  </div>
-
-                  {/* Inline profile editor */}
-                  {editingProfile && (
-                    <div className="mt-6 pt-6 border-t border-white/10">
-                      <h4 className="text-lg font-semibold mb-4">{hapticProfiles.some(p => p.id === editingProfile.id) ? "Edit Profile" : "New Profile"}</h4>
-                      <div className="mb-6">
-                        <label className="block text-sm font-medium text-white/70 mb-2">Profile Name</label>
-                        <input
-                          type="text" value={editingProfile.name} placeholder="My Custom Profile"
-                          onChange={(e) => setEditingProfile({ ...editingProfile, name: e.target.value })}
-                          className="w-full glass-input rounded-xl p-3 text-white outline-none font-medium placeholder:text-white/20"
-                        />
-                      </div>
-
-                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-                        {(['left', 'right'] as const).map(side => {
-                          const cfg = editingProfile[side];
-                          const updateSide = (field: keyof TriggerConfig, value: number) => {
-                            setEditingProfile({ ...editingProfile, [side]: { ...cfg, [field]: value } });
-                          };
-                          return (
-                            <div key={side} className="bg-white/[0.03] rounded-2xl p-5 border border-white/5">
-                              <div className="text-sm font-bold text-white/60 mb-4">{side === 'left' ? 'L2 -- Left Trigger' : 'R2 -- Right Trigger'}</div>
-                              <div className="space-y-5">
-                                <div>
-                                  <label className="block text-xs font-medium text-white/50 mb-2">Mode</label>
-                                  <div className="relative">
-                                    <select value={cfg.mode} onChange={(e) => updateSide('mode', parseInt(e.target.value))}
-                                      className="w-full glass-input rounded-lg p-3 text-white text-sm outline-none appearance-none font-medium">
-                                      {Object.entries(MODE_LABELS).map(([v, l]) => (
-                                        <option key={v} value={v} className="bg-neutral-900">{l}</option>
-                                      ))}
-                                    </select>
-                                    <ChevronDown size={12} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
-                                  </div>
-                                </div>
-                                {cfg.mode !== 0 && (<>
-                                  <SliderRow label="Force" value={cfg.force} max={255} color="bg-purple-500" onChange={(v) => updateSide('force', v)} />
-                                  <SliderRow label="Start Pos" value={cfg.startPos} max={255} color="bg-blue-500" onChange={(v) => updateSide('startPos', v)} />
-                                  {(cfg.mode === 2 || cfg.mode === 39) && (
-                                    <SliderRow label="End Pos" value={cfg.endPos} max={255} color="bg-cyan-500" onChange={(v) => updateSide('endPos', v)} />
-                                  )}
-                                  {(cfg.mode === 6 || cfg.mode === 39) && (
-                                    <SliderRow label="Frequency" value={cfg.frequency} max={255} color="bg-amber-500" onChange={(v) => updateSide('frequency', v)} />
-                                  )}
-                                </>)}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-
-                      <div className="flex gap-3 justify-end">
-                        <button onClick={() => setEditingProfile(null)}
-                          className="glass-button px-5 py-2.5 rounded-xl text-sm font-medium text-white/50">Cancel</button>
-                        <button
-                          disabled={!editingProfile.name.trim()}
-                          onClick={() => saveHapticProfile(editingProfile)}
-                          className="bg-purple-600 hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed px-5 py-2.5 rounded-xl text-sm font-medium transition-colors"
-                        >Save Profile</button>
-                      </div>
+                    <div>
+                      <h3 className="text-lg font-semibold mb-1">Haptic Library</h3>
+                      <p className="text-white/50 text-sm leading-relaxed">
+                        Trigger profiles are now managed from the dedicated <span className="text-white/70 font-medium">Haptics</span> tab,
+                        where you can browse built-ins, edit both triggers live, and save custom setups with advanced controls.
+                      </p>
                     </div>
-                  )}
+                  </div>
                 </div>
 
                 <div className="glass-panel p-8 rounded-3xl">
-                  <div className="flex items-center justify-between mb-6">
-                    <div className="flex items-center gap-3">
-                      <div className="p-3 rounded-xl bg-blue-500/10 border border-blue-500/20">
-                        <Keyboard size={20} className="text-blue-400" />
-                      </div>
-                      <div>
-                        <h3 className="text-lg font-semibold">Mapping Profiles</h3>
-                        <p className="text-white/50 text-sm">Save the current mapping as reusable custom profiles.</p>
-                      </div>
+                  <div className="flex items-start gap-4">
+                    <div className="p-3 rounded-xl bg-blue-500/10 border border-blue-500/20 mt-0.5">
+                      <Keyboard size={20} className="text-blue-400" />
                     </div>
-                    <button
-                      onClick={createMappingProfileFromCurrent}
-                      className="glass-button flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium"
-                    >
-                      <Plus size={16} /> New Profile
-                    </button>
-                  </div>
-
-                  <div className="space-y-3 mb-2">
-                    {customMappingProfiles.map((profile) => (
-                      <div
-                        key={profile.id}
-                        className={`flex items-center justify-between p-4 rounded-xl border transition-colors ${
-                          activeMappingProfileId === profile.id
-                            ? "bg-blue-500/10 border-blue-500/20"
-                            : "bg-white/[0.03] border-white/5"
-                        }`}
-                      >
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="font-medium truncate">{profile.name}</span>
-                            {activeMappingProfileId === profile.id && (
-                              <span className="text-[10px] uppercase tracking-wider text-blue-300 bg-blue-500/10 px-1.5 py-0.5 rounded">
-                                Active
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-xs text-white/40 mt-1">
-                            Edit bindings from the Mapping tab after selecting this profile.
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-1.5 ml-4">
-                          <button
-                            onClick={() => applyMappingPreset(profile.id)}
-                            className="px-3 py-2 hover:bg-white/10 rounded-lg transition-colors text-xs font-medium text-white/60 hover:text-white"
-                            title="Use"
-                          >
-                            Use
-                          </button>
-                          <button
-                            onClick={() => loadCustomMappingProfileForEditing(profile)}
-                            className="p-2 hover:bg-white/10 rounded-lg transition-colors text-white/40 hover:text-white"
-                            title="Rename"
-                          >
-                            <Pencil size={14} />
-                          </button>
-                          <button
-                            onClick={() => deleteMappingLibraryProfile(profile.id)}
-                            className="p-2 hover:bg-red-500/20 rounded-lg transition-colors text-white/40 hover:text-red-400"
-                            title="Delete"
-                          >
-                            <Trash2 size={14} />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                    {customMappingProfiles.length === 0 && (
-                      <div className="text-center py-8 text-white/30 text-sm">
-                        No custom mapping profiles yet. Save one from the current mapping.
-                      </div>
-                    )}
-                  </div>
-
-                  {editingMappingProfile && (
-                    <div className="mt-6 pt-6 border-t border-white/10">
-                      <h4 className="text-lg font-semibold mb-4">
-                        {customMappingProfiles.some((profile) => profile.id === editingMappingProfile.id)
-                          ? "Rename Profile"
-                          : "New Mapping Profile"}
-                      </h4>
-                      <div className="mb-3">
-                        <label className="block text-sm font-medium text-white/70 mb-2">Profile Name</label>
-                        <input
-                          type="text"
-                          value={editingMappingProfile.name}
-                          placeholder="My Keyboard Layout"
-                          onChange={(e) => setEditingMappingProfile({ ...editingMappingProfile, name: e.target.value })}
-                          className="w-full glass-input rounded-xl p-3 text-white outline-none font-medium placeholder:text-white/20"
-                        />
-                      </div>
-                      <p className="text-sm text-white/40 mb-6">
-                        This saves the current mapping snapshot. After selecting a custom profile in the Mapping tab,
-                        future edits are saved back into that profile automatically.
+                    <div>
+                      <h3 className="text-lg font-semibold mb-1">Mapping Profiles</h3>
+                      <p className="text-white/50 text-sm leading-relaxed">
+                        Mapping profiles now live in the dedicated <span className="text-white/70 font-medium">Mapping</span> tab,
+                        where profile selection, saving, renaming, key capture, and output target changes all happen in one place.
                       </p>
-                      <div className="flex gap-3 justify-end">
-                        <button
-                          onClick={() => setEditingMappingProfile(null)}
-                          className="glass-button px-5 py-2.5 rounded-xl text-sm font-medium text-white/50"
-                        >
-                          Cancel
-                        </button>
-                        <button
-                          disabled={!editingMappingProfile.name.trim()}
-                          onClick={() => saveMappingLibraryProfile(editingMappingProfile)}
-                          className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-5 py-2.5 rounded-xl text-sm font-medium transition-colors"
-                        >
-                          Save Profile
-                        </button>
-                      </div>
                     </div>
-                  )}
+                  </div>
                 </div>
               </div>
             </div>
           )}
-        </div>
+            </div>
+          </>
+        ) : (
+          <DisconnectedPlaceholder />
+        )}
+
+        {showStartupSplash && (
+          <StartupSplash
+            exiting={startupSplashExiting}
+            previewGlow={previewGlow}
+          />
+        )}
       </div>
     </div>
   );
@@ -1842,594 +3355,117 @@ function SliderRow({ label, value, max, color, onChange }: { label: string; valu
   );
 }
 
-function createButtonBindingTarget(type: ButtonBindingTarget["type"], current: ButtonBindingTarget): ButtonBindingTarget {
-  switch (type) {
-    case "disabled":
-      return { type: "disabled" };
-    case "xboxButton":
-      return {
-        type: "xboxButton",
-        button: current.type === "xboxButton" ? current.button : "a",
-      };
-    case "keyboardKey":
-      return {
-        type: "keyboardKey",
-        key: current.type === "keyboardKey" ? current.key : "space",
-      };
-    case "mouseButton":
-      return {
-        type: "mouseButton",
-        button: current.type === "mouseButton" ? current.button : "left",
-      };
-  }
-}
-
-function MappingButtonRow({
-  label,
-  description,
-  binding,
-  onTypeChange,
-  onBindingChange,
+function StartupSplash({
+  exiting,
+  previewGlow,
 }: {
-  label: string;
-  description: string;
-  binding: ButtonBindingTarget;
-  onTypeChange: (type: ButtonBindingTarget["type"]) => void;
-  onBindingChange: (binding: ButtonBindingTarget) => void;
+  exiting: boolean;
+  previewGlow: string;
 }) {
   return (
-    <div className="bg-white/[0.03] border border-white/5 rounded-2xl p-4">
-      <div className="grid grid-cols-1 xl:grid-cols-[1.1fr_0.8fr_0.9fr] gap-3 items-center">
-        <div>
-          <div className="font-medium">{label}</div>
-          <div className="text-xs text-white/40 mt-1">{description}</div>
+    <div
+      className={`absolute inset-0 z-[110] flex items-center justify-center overflow-hidden bg-[#060606] transition-all duration-700 ${
+        exiting ? "pointer-events-none scale-[1.02] opacity-0" : "opacity-100"
+      }`}
+    >
+      <div
+        className="absolute inset-0 opacity-80"
+        style={{
+          background: `radial-gradient(circle at 50% 38%, ${previewGlow} 0%, rgba(10, 10, 10, 0) 35%), radial-gradient(circle at 50% 70%, rgba(37, 99, 235, 0.18) 0%, rgba(10, 10, 10, 0) 42%)`,
+        }}
+      />
+      <div className="absolute inset-0 bg-[linear-gradient(135deg,rgba(255,255,255,0.04),transparent_28%,transparent_72%,rgba(255,255,255,0.03))]" />
+
+      <div className="relative z-10 flex flex-col items-center px-8 text-center">
+        <div className="relative mb-8">
+          <div className="absolute -inset-14 rounded-full border border-white/8 animate-pulse" />
+          <div className="absolute -inset-20 rounded-full border border-blue-400/10 animate-spin" style={{ animationDuration: "14s" }} />
+          <div className="absolute -inset-8 rounded-[2rem] bg-white/5 blur-2xl" />
+          <div className="relative overflow-hidden rounded-[1.75rem] border border-white/10 bg-white/5 p-5 shadow-[0_0_50px_rgba(37,99,235,0.18)] backdrop-blur-xl">
+            <img
+              src={winSenseMark}
+              alt=""
+              className="h-20 w-20 object-cover object-top drop-shadow-[0_14px_34px_rgba(59,130,246,0.35)]"
+              draggable={false}
+            />
+          </div>
         </div>
 
-        <div className="relative">
-          <select
-            value={binding.type}
-            onChange={(e) => onTypeChange(e.target.value as ButtonBindingTarget["type"])}
-            className="w-full glass-input rounded-xl p-3 pr-9 text-sm outline-none appearance-none"
-          >
-            <option value="disabled" className="bg-neutral-900">Disabled</option>
-            <option value="xboxButton" className="bg-neutral-900">Xbox Button</option>
-            <option value="keyboardKey" className="bg-neutral-900">Keyboard Key</option>
-            <option value="mouseButton" className="bg-neutral-900">Mouse Button</option>
-          </select>
-          <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
+        <div className="max-w-xl">
+          <p className="mb-3 text-xs font-semibold uppercase tracking-[0.45em] text-blue-300/80">WinSense</p>
+          <h2 className="text-4xl font-black tracking-tight text-white sm:text-5xl">Preparing your DualSense workspace</h2>
+          <p className="mt-4 text-sm leading-relaxed text-white/55 sm:text-base">
+            Initializing controller services, profiles, lighting, calibration, and live telemetry.
+          </p>
         </div>
 
-        {binding.type === "disabled" ? (
-          <div className="text-sm text-white/35 px-3">No output</div>
-        ) : binding.type === "xboxButton" ? (
-          <ValueSelect
-            value={binding.button}
-            options={XBOX_BUTTON_OPTIONS}
-            onChange={(value) => onBindingChange({ type: "xboxButton", button: value as XboxButton })}
-          />
-        ) : binding.type === "keyboardKey" ? (
-          <ValueSelect
-            value={binding.key}
-            options={KEY_OPTIONS}
-            onChange={(value) => onBindingChange({ type: "keyboardKey", key: value as KeyCode })}
-          />
-        ) : (
-          <ValueSelect
-            value={binding.button}
-            options={MOUSE_BUTTON_OPTIONS}
-            onChange={(value) => onBindingChange({ type: "mouseButton", button: value as MouseButton })}
-          />
-        )}
+        <div className="mt-8 flex items-center gap-3 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-white/60 backdrop-blur-xl">
+          <Loader2 size={16} className="animate-spin text-blue-300" />
+          <span>Loading WinSense</span>
+        </div>
       </div>
     </div>
   );
 }
 
-function StickBindingCard({
+function DisconnectedPlaceholder() {
+  return (
+    <div className="relative z-10 flex flex-1 items-center justify-center p-8">
+      <div className="w-full max-w-3xl overflow-hidden rounded-[2rem] border border-white/10 bg-[linear-gradient(160deg,rgba(255,255,255,0.05),rgba(255,255,255,0.02))] p-8 shadow-[0_24px_80px_rgba(0,0,0,0.45)] backdrop-blur-2xl sm:p-12">
+        <div className="mx-auto flex max-w-2xl flex-col items-center text-center">
+          <div className="mb-6 flex h-24 w-24 items-center justify-center rounded-[2rem] border border-blue-400/15 bg-blue-500/10 shadow-[0_0_50px_rgba(37,99,235,0.18)]">
+            <Gamepad2 size={44} className="text-blue-300" />
+          </div>
+
+          <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-amber-400/20 bg-amber-500/10 px-4 py-2 text-sm text-amber-200">
+            <Usb size={16} />
+            <span>Connect a DualSense controller to continue</span>
+          </div>
+
+          <h2 className="text-4xl font-black tracking-tight text-white">Waiting for your controller</h2>
+          <p className="mt-4 max-w-xl text-base leading-relaxed text-white/55">
+            WinSense unlocks calibration, mapping, lighting, haptics, audio, and telemetry once a DualSense is detected.
+            Plug one in and the full app will appear automatically.
+          </p>
+
+          <div className="mt-8 grid w-full grid-cols-1 gap-4 text-left sm:grid-cols-3">
+            <PlaceholderStep
+              title="1. Connect a DualSense"
+              body="Use USB for the most reliable setup and for firmware calibration."
+            />
+            <PlaceholderStep
+              title="2. Wait for detection"
+              body="The app listens for controller changes live, so no restart is needed."
+            />
+            <PlaceholderStep
+              title="3. Start customizing"
+              body="As soon as the controller is ready, the full WinSense dashboard returns."
+            />
+          </div>
+
+          <div className="mt-8 flex items-center gap-3 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-white/60">
+            <Loader2 size={16} className="animate-spin text-blue-300" />
+            <span>Listening for a DualSense connection</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlaceholderStep({
   title,
-  subtitle,
-  binding,
-  onChange,
+  body,
 }: {
   title: string;
-  subtitle: string;
-  binding: StickBinding;
-  onChange: (binding: StickBinding) => void;
+  body: string;
 }) {
   return (
-    <div className="glass-panel p-8 rounded-3xl">
-      <div className="flex items-start justify-between gap-4 mb-6">
-        <div>
-          <h3 className="text-2xl font-semibold">{title}</h3>
-          <p className="text-white/45 text-sm mt-1">{subtitle}</p>
-        </div>
-        <div className="w-11 h-11 rounded-2xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center">
-          <Gamepad2 size={20} className="text-blue-400" />
-        </div>
-      </div>
-
-      <div className="space-y-5">
-        <div className="relative">
-          <select
-            value={binding.type}
-            onChange={(e) => {
-              const type = e.target.value as StickBinding["type"];
-              if (type === "disabled") onChange({ type: "disabled" });
-              if (type === "xboxStick") onChange({ type: "xboxStick", stick: "left" });
-              if (type === "keyboard4") onChange({ type: "keyboard4", up: "w", down: "s", left: "a", right: "d", threshold: 0.35 });
-              if (type === "mouseMove") onChange({ type: "mouseMove", sensitivity: 18, deadzone: 0.2 });
-            }}
-            className="w-full glass-input rounded-xl p-3 pr-9 text-sm outline-none appearance-none"
-          >
-            <option value="disabled" className="bg-neutral-900">Disabled</option>
-            <option value="xboxStick" className="bg-neutral-900">Xbox Stick</option>
-            <option value="keyboard4" className="bg-neutral-900">Keyboard 4-Way</option>
-            <option value="mouseMove" className="bg-neutral-900">Mouse Move</option>
-          </select>
-          <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
-        </div>
-
-        {binding.type === "disabled" && <div className="text-sm text-white/35">This stick will not send any mapped output.</div>}
-
-        {binding.type === "xboxStick" && (
-          <ValueSelect
-            value={binding.stick}
-            options={XBOX_STICK_OPTIONS}
-            onChange={(value) => onChange({ type: "xboxStick", stick: value as XboxStick })}
-          />
-        )}
-
-        {binding.type === "keyboard4" && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <ValueSelect
-              label="Up"
-              value={binding.up}
-              options={KEY_OPTIONS}
-              onChange={(value) => onChange({ ...binding, up: value as KeyCode })}
-            />
-            <ValueSelect
-              label="Down"
-              value={binding.down}
-              options={KEY_OPTIONS}
-              onChange={(value) => onChange({ ...binding, down: value as KeyCode })}
-            />
-            <ValueSelect
-              label="Left"
-              value={binding.left}
-              options={KEY_OPTIONS}
-              onChange={(value) => onChange({ ...binding, left: value as KeyCode })}
-            />
-            <ValueSelect
-              label="Right"
-              value={binding.right}
-              options={KEY_OPTIONS}
-              onChange={(value) => onChange({ ...binding, right: value as KeyCode })}
-            />
-            <RangeField
-              label="Threshold"
-              value={binding.threshold}
-              min={0.1}
-              max={0.9}
-              step={0.05}
-              formatter={(value) => `${value.toFixed(2)}`}
-              onChange={(value) => onChange({ ...binding, threshold: value })}
-            />
-          </div>
-        )}
-
-        {binding.type === "mouseMove" && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <RangeField
-              label="Sensitivity"
-              value={binding.sensitivity}
-              min={1}
-              max={40}
-              step={1}
-              formatter={(value) => `${value.toFixed(0)} px/tick`}
-              onChange={(value) => onChange({ ...binding, sensitivity: value })}
-            />
-            <RangeField
-              label="Deadzone"
-              value={binding.deadzone}
-              min={0}
-              max={0.8}
-              step={0.05}
-              formatter={(value) => `${value.toFixed(2)}`}
-              onChange={(value) => onChange({ ...binding, deadzone: value })}
-            />
-          </div>
-        )}
-      </div>
+    <div className="rounded-2xl border border-white/8 bg-black/20 p-4">
+      <div className="mb-2 text-sm font-semibold text-white/85">{title}</div>
+      <p className="text-sm leading-relaxed text-white/50">{body}</p>
     </div>
   );
-}
-
-function TriggerBindingCard({
-  title,
-  subtitle,
-  binding,
-  onChange,
-}: {
-  title: string;
-  subtitle: string;
-  binding: TriggerBinding;
-  onChange: (binding: TriggerBinding) => void;
-}) {
-  return (
-    <div className="glass-panel p-8 rounded-3xl">
-      <div className="flex items-start justify-between gap-4 mb-6">
-        <div>
-          <h3 className="text-2xl font-semibold">{title}</h3>
-          <p className="text-white/45 text-sm mt-1">{subtitle}</p>
-        </div>
-        <div className="w-11 h-11 rounded-2xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
-          <Sliders size={20} className="text-purple-400" />
-        </div>
-      </div>
-
-      <div className="space-y-5">
-        <div className="relative">
-          <select
-            value={binding.type}
-            onChange={(e) => {
-              const type = e.target.value as TriggerBinding["type"];
-              if (type === "disabled") onChange({ type: "disabled" });
-              if (type === "xboxTrigger") onChange({ type: "xboxTrigger", trigger: "left" });
-              if (type === "keyboardKey") onChange({ type: "keyboardKey", key: "space", threshold: 40 });
-              if (type === "mouseButton") onChange({ type: "mouseButton", button: "left", threshold: 40 });
-            }}
-            className="w-full glass-input rounded-xl p-3 pr-9 text-sm outline-none appearance-none"
-          >
-            <option value="disabled" className="bg-neutral-900">Disabled</option>
-            <option value="xboxTrigger" className="bg-neutral-900">Xbox Trigger</option>
-            <option value="keyboardKey" className="bg-neutral-900">Keyboard Key</option>
-            <option value="mouseButton" className="bg-neutral-900">Mouse Button</option>
-          </select>
-          <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
-        </div>
-
-        {binding.type === "disabled" && <div className="text-sm text-white/35">This trigger will not send any mapped output.</div>}
-
-        {binding.type === "xboxTrigger" && (
-          <ValueSelect
-            value={binding.trigger}
-            options={XBOX_TRIGGER_OPTIONS}
-            onChange={(value) => onChange({ type: "xboxTrigger", trigger: value as XboxTrigger })}
-          />
-        )}
-
-        {binding.type === "keyboardKey" && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <ValueSelect
-              label="Key"
-              value={binding.key}
-              options={KEY_OPTIONS}
-              onChange={(value) => onChange({ ...binding, key: value as KeyCode })}
-            />
-            <RangeField
-              label="Activation Threshold"
-              value={binding.threshold}
-              min={1}
-              max={255}
-              step={1}
-              formatter={(value) => `${value.toFixed(0)}`}
-              onChange={(value) => onChange({ ...binding, threshold: Math.round(value) })}
-            />
-          </div>
-        )}
-
-        {binding.type === "mouseButton" && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <ValueSelect
-              label="Mouse Button"
-              value={binding.button}
-              options={MOUSE_BUTTON_OPTIONS}
-              onChange={(value) => onChange({ ...binding, button: value as MouseButton })}
-            />
-            <RangeField
-              label="Activation Threshold"
-              value={binding.threshold}
-              min={1}
-              max={255}
-              step={1}
-              formatter={(value) => `${value.toFixed(0)}`}
-              onChange={(value) => onChange({ ...binding, threshold: Math.round(value) })}
-            />
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ValueSelect({
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  label?: string;
-  value: string;
-  options: Array<{ value: string; label: string }>;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <div>
-      {label && <div className="text-xs uppercase tracking-[0.15em] text-white/35 mb-2">{label}</div>}
-      <div className="relative">
-        <select
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="w-full glass-input rounded-xl p-3 pr-9 text-sm outline-none appearance-none"
-        >
-          {options.map((option) => (
-            <option key={option.value} value={option.value} className="bg-neutral-900">
-              {option.label}
-            </option>
-          ))}
-        </select>
-        <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-white/50" />
-      </div>
-    </div>
-  );
-}
-
-function RangeField({
-  label,
-  value,
-  min,
-  max,
-  step,
-  formatter,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  formatter: (value: number) => string;
-  onChange: (value: number) => void;
-}) {
-  const pct = ((value - min) / (max - min)) * 100;
-  return (
-    <div>
-      <div className="flex justify-between mb-2">
-        <label className="text-sm font-medium text-white/70">{label}</label>
-        <span className="text-white/50 font-mono bg-black/30 px-2 py-0.5 rounded-md text-xs">
-          {formatter(value)}
-        </span>
-      </div>
-      <div className="relative h-2 rounded-full bg-white/10">
-        <div className="absolute top-0 left-0 h-full rounded-full bg-blue-500" style={{ width: `${pct}%` }} />
-        <input
-          type="range"
-          min={min}
-          max={max}
-          step={step}
-          value={value}
-          onChange={(e) => onChange(parseFloat(e.target.value))}
-          className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer"
-        />
-        <div
-          className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full shadow-lg pointer-events-none"
-          style={{ left: `calc(${pct}% - 8px)` }}
-        />
-      </div>
-    </div>
-  );
-}
-
-function CalibrationStickCard({
-  title,
-  snapshot,
-  calibration,
-  onCenterFromCurrent,
-  onChange,
-}: {
-  title: string;
-  snapshot: StickSnapshot;
-  calibration: CalibrationProfile["leftStick"];
-  onCenterFromCurrent: () => void;
-  onChange: (next: CalibrationProfile["leftStick"]) => void;
-}) {
-  return (
-    <div className="glass-panel p-8 rounded-3xl">
-      <div className="flex items-start justify-between gap-4 mb-6">
-        <div>
-          <h3 className="text-2xl font-semibold">{title}</h3>
-          <p className="text-white/45 text-sm mt-1">Raw and corrected stick position with drift controls.</p>
-        </div>
-        <button onClick={onCenterFromCurrent} className="glass-button px-4 py-2 rounded-xl text-sm font-medium">
-          Set Current as Center
-        </button>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-        <StickVisualizer label="Raw" x={snapshot.normalizedX} y={snapshot.normalizedY} />
-        <StickVisualizer label="Calibrated" x={snapshot.calibratedX} y={snapshot.calibratedY} />
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-        <div className="bg-black/20 rounded-2xl border border-white/5 p-4">
-          <div className="text-xs uppercase tracking-[0.15em] text-white/35 mb-3">Live Readout</div>
-          <div className="space-y-2 text-sm">
-            <div className="flex justify-between"><span className="text-white/50">Raw X</span><span className="font-mono">{snapshot.normalizedX.toFixed(3)}</span></div>
-            <div className="flex justify-between"><span className="text-white/50">Raw Y</span><span className="font-mono">{snapshot.normalizedY.toFixed(3)}</span></div>
-            <div className="flex justify-between"><span className="text-white/50">Calibrated X</span><span className="font-mono">{snapshot.calibratedX.toFixed(3)}</span></div>
-            <div className="flex justify-between"><span className="text-white/50">Calibrated Y</span><span className="font-mono">{snapshot.calibratedY.toFixed(3)}</span></div>
-          </div>
-        </div>
-        <div className="bg-black/20 rounded-2xl border border-white/5 p-4">
-          <div className="text-xs uppercase tracking-[0.15em] text-white/35 mb-3">Calibration</div>
-          <div className="space-y-2 text-sm">
-            <div className="flex justify-between"><span className="text-white/50">Center X</span><span className="font-mono">{calibration.centerX.toFixed(3)}</span></div>
-            <div className="flex justify-between"><span className="text-white/50">Center Y</span><span className="font-mono">{calibration.centerY.toFixed(3)}</span></div>
-            <div className="flex justify-between"><span className="text-white/50">Deadzone</span><span className="font-mono">{calibration.deadzone.toFixed(2)}</span></div>
-            <div className="flex justify-between"><span className="text-white/50">Outer Scale</span><span className="font-mono">{calibration.outerScale.toFixed(2)}x</span></div>
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <RangeField
-          label="Center X Offset"
-          value={calibration.centerX}
-          min={-0.5}
-          max={0.5}
-          step={0.01}
-          formatter={(value) => value.toFixed(2)}
-          onChange={(value) => onChange({ ...calibration, centerX: value })}
-        />
-        <RangeField
-          label="Center Y Offset"
-          value={calibration.centerY}
-          min={-0.5}
-          max={0.5}
-          step={0.01}
-          formatter={(value) => value.toFixed(2)}
-          onChange={(value) => onChange({ ...calibration, centerY: value })}
-        />
-        <RangeField
-          label="Deadzone"
-          value={calibration.deadzone}
-          min={0}
-          max={0.35}
-          step={0.01}
-          formatter={(value) => value.toFixed(2)}
-          onChange={(value) => onChange({ ...calibration, deadzone: value })}
-        />
-        <RangeField
-          label="Outer Scale"
-          value={calibration.outerScale}
-          min={0.5}
-          max={1.5}
-          step={0.01}
-          formatter={(value) => `${value.toFixed(2)}x`}
-          onChange={(value) => onChange({ ...calibration, outerScale: value })}
-        />
-      </div>
-    </div>
-  );
-}
-
-function CalibrationTriggerCard({
-  title,
-  snapshot,
-  calibration,
-  onChange,
-}: {
-  title: string;
-  snapshot: TriggerSnapshot;
-  calibration: CalibrationProfile["leftTrigger"];
-  onChange: (next: CalibrationProfile["leftTrigger"]) => void;
-}) {
-  return (
-    <div className="glass-panel p-8 rounded-3xl">
-      <div className="mb-6">
-        <h3 className="text-2xl font-semibold">{title}</h3>
-        <p className="text-white/45 text-sm mt-1">Trim initial slack and compress or extend usable trigger range.</p>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-        <TriggerMeter label="Raw" value={snapshot.normalized} rawValue={snapshot.rawValue} />
-        <TriggerMeter label="Calibrated" value={snapshot.calibratedNormalized} rawValue={snapshot.calibratedValue} />
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <RangeField
-          label="Deadzone"
-          value={calibration.deadzone}
-          min={0}
-          max={100}
-          step={1}
-          formatter={(value) => `${value.toFixed(0)}`}
-          onChange={(value) => onChange({ ...calibration, deadzone: Math.round(value) })}
-        />
-        <RangeField
-          label="Maximum Range"
-          value={calibration.maxValue}
-          min={100}
-          max={255}
-          step={1}
-          formatter={(value) => `${value.toFixed(0)}`}
-          onChange={(value) => onChange({ ...calibration, maxValue: Math.round(value) })}
-        />
-      </div>
-    </div>
-  );
-}
-
-function StickVisualizer({
-  label,
-  x,
-  y,
-}: {
-  label: string;
-  x: number;
-  y: number;
-}) {
-  const left = `${((x + 1) / 2) * 100}%`;
-  const top = `${((y + 1) / 2) * 100}%`;
-
-  return (
-    <div className="bg-black/20 rounded-2xl border border-white/5 p-4">
-      <div className="text-xs uppercase tracking-[0.15em] text-white/35 mb-3">{label}</div>
-      <div className="relative aspect-square rounded-2xl border border-white/10 bg-[radial-gradient(circle_at_center,rgba(59,130,246,0.12),transparent_65%)]">
-        <div className="absolute inset-x-1/2 top-0 bottom-0 w-px bg-white/10" />
-        <div className="absolute inset-y-1/2 left-0 right-0 h-px bg-white/10" />
-        <div
-          className="absolute w-4 h-4 rounded-full bg-blue-400 shadow-[0_0_18px_rgba(96,165,250,0.75)] -translate-x-1/2 -translate-y-1/2"
-          style={{ left, top }}
-        />
-      </div>
-    </div>
-  );
-}
-
-function TriggerMeter({
-  label,
-  value,
-  rawValue,
-}: {
-  label: string;
-  value: number;
-  rawValue: number;
-}) {
-  const pct = Math.max(0, Math.min(100, value * 100));
-  return (
-    <div className="bg-black/20 rounded-2xl border border-white/5 p-4">
-      <div className="flex justify-between mb-3">
-        <span className="text-xs uppercase tracking-[0.15em] text-white/35">{label}</span>
-        <span className="text-xs text-white/45 font-mono">{rawValue}</span>
-      </div>
-      <div className="relative h-3 rounded-full bg-white/10 overflow-hidden">
-        <div className="absolute inset-y-0 left-0 rounded-full bg-purple-500" style={{ width: `${pct}%` }} />
-      </div>
-      <div className="mt-2 text-sm text-white/55">{value.toFixed(3)}</div>
-    </div>
-  );
-}
-
-function formatFirmwareStep(step: FirmwareCalibrationStatus["step"]) {
-  switch (step) {
-    case "idle":
-      return "Idle";
-    case "centerSampling":
-      return "Center Sampling";
-    case "centerSampled":
-      return "Center Ready";
-    case "rangeSampling":
-      return "Range Sampling";
-    case "completedTemporary":
-      return "Temporary Saved";
-    case "completedPermanent":
-      return "Permanent Saved";
-    case "cancelled":
-      return "Cancelled";
-    case "error":
-      return "Error";
-  }
 }
 
 export default App;

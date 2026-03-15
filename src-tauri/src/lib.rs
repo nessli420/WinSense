@@ -1,13 +1,12 @@
 pub mod controller;
-use serde::Deserialize;
+mod persisted_state;
 use std::{
-    fs,
-    thread,
-    time::Duration,
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     },
+    thread,
+    time::Duration,
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -15,7 +14,6 @@ use tauri::{
     AppHandle, Emitter, Manager, Runtime, Window, WindowEvent,
 };
 
-const APP_STATE_FILE: &str = "app-state.json";
 const AUTOSTART_FLAG: &str = "--autostart";
 const TRAY_SHOW_ID: &str = "tray_show";
 const TRAY_QUIT_ID: &str = "tray_quit";
@@ -43,35 +41,11 @@ struct RuntimeSettings {
     is_quitting: AtomicBool,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PersistedRuntimeSettings {
-    close_to_tray: Option<bool>,
-    startup_open_mode: Option<String>,
-}
-
-fn load_persisted_runtime_settings<R: Runtime>(app: &AppHandle<R>) -> PersistedRuntimeSettings {
-    let Ok(mut path) = app.path().app_data_dir() else {
-        return PersistedRuntimeSettings::default();
-    };
-    path.push(APP_STATE_FILE);
-
-    let Ok(contents) = fs::read_to_string(path) else {
-        return PersistedRuntimeSettings::default();
-    };
-
-    serde_json::from_str(&contents).unwrap_or_default()
-}
-
 fn apply_runtime_settings<R: Runtime>(app: &AppHandle<R>, settings: &RuntimeSettings) {
-    let persisted = load_persisted_runtime_settings(app);
+    let persisted = persisted_state::load_runtime_settings(app);
     *settings.close_to_tray.lock().unwrap() = persisted.close_to_tray.unwrap_or(false);
-    *settings.startup_open_mode.lock().unwrap() = StartupOpenMode::from_value(
-        persisted
-            .startup_open_mode
-            .as_deref()
-            .unwrap_or("normal"),
-    );
+    *settings.startup_open_mode.lock().unwrap() =
+        StartupOpenMode::from_value(persisted.startup_open_mode.as_deref().unwrap_or("normal"));
 }
 
 fn restore_main_window<R: Runtime>(app: &AppHandle<R>) {
@@ -163,7 +137,12 @@ fn greet(name: &str) -> String {
 }
 
 #[tauri::command]
-fn set_lightbar(state: tauri::State<'_, controller::AppState>, r: u8, g: u8, b: u8) -> Result<(), String> {
+fn set_lightbar(
+    state: tauri::State<'_, controller::AppState>,
+    r: u8,
+    g: u8,
+    b: u8,
+) -> Result<(), String> {
     controller::set_lightbar(state.controller.clone(), r, g, b);
     Ok(())
 }
@@ -171,21 +150,123 @@ fn set_lightbar(state: tauri::State<'_, controller::AppState>, r: u8, g: u8, b: 
 #[tauri::command]
 fn set_triggers(
     state: tauri::State<'_, controller::AppState>,
-    left_mode: u8, left_force: u8, left_start: u8, left_end: u8, left_frequency: u8,
-    right_mode: u8, right_force: u8, right_start: u8, right_end: u8, right_frequency: u8,
+    left: controller::TriggerEffectConfig,
+    right: controller::TriggerEffectConfig,
 ) -> Result<(), String> {
-    controller::set_triggers(
+    controller::set_triggers(state.controller.clone(), left, right);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_adaptive_triggers(
+    state: tauri::State<'_, controller::AppState>,
+    left: controller::TriggerEffectConfig,
+    right: controller::TriggerEffectConfig,
+) -> Result<(), String> {
+    controller::set_adaptive_triggers(state.controller.clone(), left, right);
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_adaptive_triggers(state: tauri::State<'_, controller::AppState>) -> Result<(), String> {
+    controller::clear_adaptive_triggers(state.controller.clone());
+    Ok(())
+}
+
+#[tauri::command]
+fn sync_adaptive_trigger_settings(
+    state: tauri::State<'_, controller::AppState>,
+    settings: controller::AdaptiveTriggerRuntimeSettings,
+) -> Result<(), String> {
+    controller::sync_adaptive_trigger_settings(state.controller.clone(), settings);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_game_telemetry_status(
+    state: tauri::State<'_, controller::AppState>,
+) -> Result<controller::GameTelemetryStatus, String> {
+    Ok(controller::get_game_telemetry_status(
         state.controller.clone(),
-        left_mode, left_force, left_start, left_end, left_frequency,
-        right_mode, right_force, right_start, right_end, right_frequency,
+    ))
+}
+
+#[tauri::command]
+fn capture_live_ocr_calibration_preview(
+    settings: controller::AdaptiveTriggerRuntimeSettings,
+) -> Result<controller::OcrCalibrationPreview, String> {
+    controller::capture_live_ocr_calibration_preview(settings)
+}
+
+#[tauri::command]
+fn list_live_ocr_process_options() -> Result<Vec<controller::ActiveProcessOption>, String> {
+    controller::list_live_ocr_process_options()
+}
+
+#[tauri::command]
+fn set_rumble(
+    state: tauri::State<'_, controller::AppState>,
+    left: u8,
+    right: u8,
+) -> Result<(), String> {
+    controller::set_rumble(state.controller.clone(), left, right);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_audio(
+    state: tauri::State<'_, controller::AppState>,
+) -> Result<controller::AudioSettings, String> {
+    Ok(controller::get_audio(state.controller.clone()))
+}
+
+#[tauri::command]
+fn set_audio(
+    state: tauri::State<'_, controller::AppState>,
+    speaker_volume: u8,
+    headphone_volume: u8,
+    mic_volume: u8,
+    mic_mute: bool,
+    audio_mute: bool,
+    mic_mute_led: u8,
+    force_internal_mic: bool,
+    force_internal_speaker: bool,
+) -> Result<(), String> {
+    controller::set_audio(
+        state.controller.clone(),
+        speaker_volume,
+        headphone_volume,
+        mic_volume,
+        mic_mute,
+        audio_mute,
+        mic_mute_led,
+        force_internal_mic,
+        force_internal_speaker,
     );
     Ok(())
 }
 
 #[tauri::command]
-fn set_rumble(state: tauri::State<'_, controller::AppState>, left: u8, right: u8) -> Result<(), String> {
-    controller::set_rumble(state.controller.clone(), left, right);
+fn test_speaker(state: tauri::State<'_, controller::AppState>) -> Result<(), String> {
+    controller::test_speaker(state.controller.clone())
+}
+
+#[tauri::command]
+fn start_mic_test(state: tauri::State<'_, controller::AppState>) -> Result<(), String> {
+    controller::start_mic_test(state.controller.clone())
+}
+
+#[tauri::command]
+fn stop_mic_test(state: tauri::State<'_, controller::AppState>) -> Result<(), String> {
+    controller::stop_mic_test(state.controller.clone());
     Ok(())
+}
+
+#[tauri::command]
+fn get_audio_test_status(
+    state: tauri::State<'_, controller::AppState>,
+) -> Result<(bool, bool), String> {
+    Ok(controller::get_audio_test_status(state.controller.clone()))
 }
 
 #[tauri::command]
@@ -195,13 +276,19 @@ fn get_controller_status(state: tauri::State<'_, controller::AppState>) -> Resul
 }
 
 #[tauri::command]
-fn set_touchpad_enabled(state: tauri::State<'_, controller::AppState>, enabled: bool) -> Result<(), String> {
+fn set_touchpad_enabled(
+    state: tauri::State<'_, controller::AppState>,
+    enabled: bool,
+) -> Result<(), String> {
     controller::set_touchpad_enabled(state.controller.clone(), enabled);
     Ok(())
 }
 
 #[tauri::command]
-fn set_touchpad_sensitivity(state: tauri::State<'_, controller::AppState>, sensitivity: f64) -> Result<(), String> {
+fn set_touchpad_sensitivity(
+    state: tauri::State<'_, controller::AppState>,
+    sensitivity: f64,
+) -> Result<(), String> {
     controller::set_touchpad_sensitivity(state.controller.clone(), sensitivity);
     Ok(())
 }
@@ -231,7 +318,9 @@ fn set_mapping_profile(
 fn get_calibration_profile(
     state: tauri::State<'_, controller::AppState>,
 ) -> Result<controller::CalibrationProfile, String> {
-    Ok(controller::get_calibration_profile(state.controller.clone()))
+    Ok(controller::get_calibration_profile(
+        state.controller.clone(),
+    ))
 }
 
 #[tauri::command]
@@ -247,7 +336,9 @@ fn set_calibration_profile(
 fn get_live_input_snapshot(
     state: tauri::State<'_, controller::AppState>,
 ) -> Result<controller::LiveInputSnapshot, String> {
-    Ok(controller::get_live_input_snapshot(state.controller.clone()))
+    Ok(controller::get_live_input_snapshot(
+        state.controller.clone(),
+    ))
 }
 
 #[tauri::command]
@@ -353,14 +444,19 @@ pub fn run() {
     let runtime_settings = RuntimeSettings::default();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_autostart::Builder::new().args([AUTOSTART_FLAG]).build())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .args([AUTOSTART_FLAG])
+                .build(),
+        )
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
         .manage(runtime_settings)
         .setup(|app| {
-            controller::start_controller_listener(controller_state, app.handle().clone());
+            controller::start_controller_listener(controller_state.clone(), app.handle().clone());
+            controller::start_game_monitor(controller_state, app.handle().clone());
             let settings = app.state::<RuntimeSettings>();
             apply_runtime_settings(&app.handle(), &settings);
             build_tray(&app.handle())?;
@@ -380,7 +476,10 @@ pub fn run() {
                     return;
                 }
 
-                let close_to_tray = *settings.close_to_tray.lock().unwrap_or_else(|e| e.into_inner());
+                let close_to_tray = *settings
+                    .close_to_tray
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if close_to_tray {
                     api.prevent_close();
                     hide_main_window_to_tray(window);
@@ -393,7 +492,19 @@ pub fn run() {
             greet,
             set_lightbar,
             set_triggers,
+            set_adaptive_triggers,
+            clear_adaptive_triggers,
+            sync_adaptive_trigger_settings,
+            get_game_telemetry_status,
+            capture_live_ocr_calibration_preview,
+            list_live_ocr_process_options,
             set_rumble,
+            get_audio,
+            set_audio,
+            test_speaker,
+            start_mic_test,
+            stop_mic_test,
+            get_audio_test_status,
             get_controller_status,
             set_touchpad_enabled,
             set_touchpad_sensitivity,

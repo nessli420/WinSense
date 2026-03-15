@@ -1,23 +1,48 @@
-use hidapi::{HidApi, HidDevice};
+use hidapi::{BusType, DeviceInfo, HidApi, HidDevice};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
-use vigem_client::{Client, TargetId, XButtons, XGamepad};
+use vigem_client::{
+    Client, DS4Report, DualShock4Wired, TargetId, XButtons, XGamepad, Xbox360Wired,
+};
+
+mod audio;
+mod game_monitor;
+mod reports;
+
+pub use game_monitor::{
+    capture_live_ocr_preview, default_game_telemetry_status, default_runtime_settings,
+    list_live_ocr_processes, ActiveProcessOption, AdaptiveTriggerInputSource,
+    AdaptiveTriggerRuntimeSettings, GameTelemetryStage, GameTelemetryStatus, OcrCalibrationPreview,
+    OcrCalibrationRegion,
+};
 
 #[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEINPUT, VIRTUAL_KEY,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    VIRTUAL_KEY,
 };
 
 const SONY_VID: u16 = 0x054C;
 const DUALSENSE_PID: u16 = 0x0CE6;
-const DUALSENSE_PID_BT: u16 = 0x0DF2;
+const DUALSENSE_EDGE_PID: u16 = 0x0DF2;
+const DS_INPUT_REPORT_USB: u8 = 0x01;
+const DS_INPUT_REPORT_BT: u8 = 0x31;
+const DS_OUTPUT_REPORT_USB: u8 = 0x02;
+const DS_OUTPUT_REPORT_BT: u8 = 0x31;
+const DS_OUTPUT_TAG: u8 = 0x10;
+const USB_INPUT_REPORT_LEN: usize = 64;
+const BT_INPUT_REPORT_LEN: usize = 78;
+const BT_OUTPUT_REPORT_LEN: usize = 78;
+const BT_OUTPUT_CRC_SEED: u8 = 0xA2;
+const BT_INPUT_CRC_SEED: u8 = 0xA1;
+const BT_WRITE_FAILURE_THRESHOLD: u8 = 5;
 
 const TAP_TIMEOUT_MS: u128 = 180;
 const TAP_MAX_DISTANCE_SQ: i32 = 900;
@@ -38,6 +63,15 @@ const FIRMWARE_RANGE_TARGET_ID: u8 = 2;
 const FIRMWARE_ACTION_START: u8 = 1;
 const FIRMWARE_ACTION_STORE: u8 = 2;
 const FIRMWARE_ACTION_SAMPLE: u8 = 3;
+const DUALSENSE_FEATURE_REPORT_LEN: usize = 64;
+
+const AUDIO_REPORT_BT_EXT_BASE: u8 = 0x32;
+const AUDIO_REPORT_BT_EXT_MAX: u8 = 0x39;
+const AUDIO_PAYLOAD_STEP: usize = 64;
+const AUDIO_PAYLOAD_MAX_PER_REPORT: usize = 512;
+const AUDIO_PAYLOAD_OFFSET: usize = 74;
+const AUDIO_WRITE_INTERVAL_MS: u128 = 21;
+const MAX_HID_REPORT_LEN: usize = BT_OUTPUT_REPORT_LEN + AUDIO_PAYLOAD_MAX_PER_REPORT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +117,15 @@ pub enum XboxButton {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum EmulationTarget {
+    Xbox360,
+    XboxOne,
+    XboxSeries,
+    DualShock4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum XboxStick {
     Left,
     Right,
@@ -91,6 +134,41 @@ pub enum XboxStick {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum XboxTrigger {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlayStationButton {
+    Cross,
+    Circle,
+    Square,
+    Triangle,
+    Up,
+    Right,
+    Down,
+    Left,
+    L1,
+    R1,
+    Share,
+    Options,
+    L3,
+    R3,
+    Ps,
+    Touchpad,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlayStationStick {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlayStationTrigger {
     Left,
     Right,
 }
@@ -160,6 +238,7 @@ pub enum KeyCode {
 pub enum ButtonBindingTarget {
     Disabled,
     XboxButton { button: XboxButton },
+    PlayStationButton { button: PlayStationButton },
     KeyboardKey { key: KeyCode },
     MouseButton { button: MouseButton },
 }
@@ -168,7 +247,12 @@ pub enum ButtonBindingTarget {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum StickBinding {
     Disabled,
-    XboxStick { stick: XboxStick },
+    XboxStick {
+        stick: XboxStick,
+    },
+    PlayStationStick {
+        stick: PlayStationStick,
+    },
     Keyboard4 {
         up: KeyCode,
         down: KeyCode,
@@ -176,7 +260,10 @@ pub enum StickBinding {
         right: KeyCode,
         threshold: f32,
     },
-    MouseMove { sensitivity: f32, deadzone: f32 },
+    MouseMove {
+        sensitivity: f32,
+        deadzone: f32,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -184,6 +271,7 @@ pub enum StickBinding {
 pub enum TriggerBinding {
     Disabled,
     XboxTrigger { trigger: XboxTrigger },
+    PlayStationTrigger { trigger: PlayStationTrigger },
     KeyboardKey { key: KeyCode, threshold: u8 },
     MouseButton { button: MouseButton, threshold: u8 },
 }
@@ -194,6 +282,7 @@ pub struct MappingProfile {
     pub id: String,
     pub name: String,
     pub built_in: bool,
+    pub emulation_target: EmulationTarget,
     pub button_bindings: BTreeMap<ControllerButton, ButtonBindingTarget>,
     pub left_stick: StickBinding,
     pub right_stick: StickBinding,
@@ -274,6 +363,29 @@ pub enum ConnectionTransport {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum TriggerEffectKind {
+    Off,
+    ContinuousResistance,
+    SectionResistance,
+    Vibration,
+    MachineGun,
+    Raw,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerEffectConfig {
+    pub kind: TriggerEffectKind,
+    pub start_position: Option<u8>,
+    pub end_position: Option<u8>,
+    pub force: Option<u8>,
+    pub frequency: Option<u8>,
+    pub raw_mode: Option<u8>,
+    pub raw_params: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum FirmwareCalibrationMode {
     Center,
     Range,
@@ -333,26 +445,60 @@ impl DualSenseInputState {
     }
 }
 
+pub(crate) enum VirtualTarget {
+    Xbox {
+        emulation_target: EmulationTarget,
+        device: Xbox360Wired<Client>,
+    },
+    DualShock4(DualShock4Wired<Client>),
+}
+
+impl VirtualTarget {
+    fn matches(&self, target: EmulationTarget) -> bool {
+        matches!(
+            (self, target),
+            (
+                VirtualTarget::Xbox {
+                    emulation_target: EmulationTarget::Xbox360,
+                    ..
+                },
+                EmulationTarget::Xbox360,
+            ) | (
+                VirtualTarget::Xbox {
+                    emulation_target: EmulationTarget::XboxOne,
+                    ..
+                },
+                EmulationTarget::XboxOne,
+            ) | (
+                VirtualTarget::Xbox {
+                    emulation_target: EmulationTarget::XboxSeries,
+                    ..
+                },
+                EmulationTarget::XboxSeries,
+            ) | (VirtualTarget::DualShock4(_), EmulationTarget::DualShock4)
+        )
+    }
+}
+
 pub struct ControllerState {
     pub connected: bool,
     pub output_dirty: bool,
     pub r: u8,
     pub g: u8,
     pub b: u8,
-    pub left_mode: u8,
-    pub left_force: u8,
-    pub left_start: u8,
-    pub left_end: u8,
-    pub left_frequency: u8,
-    pub right_mode: u8,
-    pub right_force: u8,
-    pub right_start: u8,
-    pub right_end: u8,
-    pub right_frequency: u8,
+    pub adaptive_trigger_settings: AdaptiveTriggerRuntimeSettings,
+    pub game_telemetry_status: GameTelemetryStatus,
+    pub manual_left_trigger: TriggerEffectConfig,
+    pub manual_right_trigger: TriggerEffectConfig,
+    pub adaptive_left_trigger: TriggerEffectConfig,
+    pub adaptive_right_trigger: TriggerEffectConfig,
+    pub adaptive_triggers_active: bool,
+    pub left_trigger: TriggerEffectConfig,
+    pub right_trigger: TriggerEffectConfig,
     pub rumble_left: u8,
     pub rumble_right: u8,
-    pub vigem_client: Option<Client>,
-    pub vigem_target: Option<TargetId>,
+    vigem_bus: Option<Client>,
+    vigem_target: Option<VirtualTarget>,
     pub touchpad_enabled: bool,
     pub touchpad_sensitivity: f64,
     pub mapping_profile: MappingProfile,
@@ -378,6 +524,25 @@ pub struct ControllerState {
     pub last_tap_button: Option<MouseButton>,
     pub drag_active: bool,
     pub drag_button: Option<MouseButton>,
+    pub bt_output_seq: u8,
+    pub speaker_volume: u8,
+    pub headphone_volume: u8,
+    pub mic_volume: u8,
+    pub mic_mute: bool,
+    pub audio_mute: bool,
+    pub mic_mute_led: u8,
+    pub force_internal_mic: bool,
+    pub force_internal_speaker: bool,
+    pub audio_buf: Vec<u8>,
+    pub audio_buf_offset: usize,
+    pub speaker_test_active: bool,
+    pub speaker_test_restore_audio: Option<AudioSettings>,
+    pub pending_speaker_restore: bool,
+    pub last_audio_write_at: Option<Instant>,
+    pub mic_test_active: bool,
+    pub mic_test_stop: Option<Arc<AtomicBool>>,
+    pub bt_mic_probe_active: bool,
+    pub bt_mic_probe_observations: Vec<String>,
 }
 
 pub struct AppState {
@@ -386,137 +551,91 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let mut vigem_client = Client::connect().ok();
-        let mut vigem_target = None;
+        let vigem_bus = Client::connect().ok();
+        let mut controller_state = ControllerState {
+            connected: false,
+            output_dirty: false,
+            r: 0,
+            g: 0,
+            b: 255,
+            adaptive_trigger_settings: default_runtime_settings(),
+            game_telemetry_status: default_game_telemetry_status(),
+            manual_left_trigger: default_trigger_effect(),
+            manual_right_trigger: default_trigger_effect(),
+            adaptive_left_trigger: default_trigger_effect(),
+            adaptive_right_trigger: default_trigger_effect(),
+            adaptive_triggers_active: false,
+            left_trigger: default_trigger_effect(),
+            right_trigger: default_trigger_effect(),
+            rumble_left: 0,
+            rumble_right: 0,
+            vigem_bus,
+            vigem_target: None,
+            touchpad_enabled: false,
+            touchpad_sensitivity: 1.0,
+            mapping_profile: default_disabled_profile(),
+            calibration_profile: default_calibration_profile(),
+            connection_transport: ConnectionTransport::Unknown,
+            firmware_status: default_firmware_calibration_status(),
+            last_input_snapshot: default_live_input_snapshot(),
+            last_input_emit_at: None,
+            active_keys: HashSet::new(),
+            active_mouse_buttons: HashSet::new(),
+            last_touch_x: None,
+            last_touch_y: None,
+            last_touch_active: false,
+            last_pad_button: false,
+            touch_start_time: None,
+            touch_start_x: 0,
+            touch_start_y: 0,
+            touch_moved: false,
+            peak_finger_count: 0,
+            last_touch_finger_count: 0,
+            click_held_button: None,
+            last_tap_time: None,
+            last_tap_button: None,
+            drag_active: false,
+            drag_button: None,
+            bt_output_seq: 0,
+            speaker_volume: 70,
+            headphone_volume: 80,
+            mic_volume: 40,
+            mic_mute: false,
+            audio_mute: false,
+            mic_mute_led: 0,
+            force_internal_mic: false,
+            force_internal_speaker: false,
+            audio_buf: Vec::new(),
+            audio_buf_offset: 0,
+            speaker_test_active: false,
+            speaker_test_restore_audio: None,
+            pending_speaker_restore: false,
+            last_audio_write_at: None,
+            mic_test_active: false,
+            mic_test_stop: None,
+            bt_mic_probe_active: false,
+            bt_mic_probe_observations: Vec::new(),
+        };
 
-        if let Some(ref mut client) = vigem_client {
-            let mut target =
-                vigem_client::Xbox360Wired::new(client, vigem_client::TargetId::XBOX360_WIRED);
-            if target.plugin().is_ok() {
-                vigem_target = Some(vigem_client::TargetId::XBOX360_WIRED);
-            }
-        }
+        let initial_target = controller_state.mapping_profile.emulation_target;
+        ensure_virtual_target(&mut controller_state, initial_target);
 
         Self {
-            controller: Arc::new(Mutex::new(ControllerState {
-                connected: false,
-                output_dirty: false,
-                r: 0,
-                g: 0,
-                b: 255,
-                left_mode: 0,
-                left_force: 0,
-                left_start: 0,
-                left_end: 180,
-                left_frequency: 30,
-                right_mode: 0,
-                right_force: 0,
-                right_start: 0,
-                right_end: 180,
-                right_frequency: 30,
-                rumble_left: 0,
-                rumble_right: 0,
-                vigem_client,
-                vigem_target,
-                touchpad_enabled: false,
-                touchpad_sensitivity: 1.0,
-                mapping_profile: default_disabled_profile(),
-                calibration_profile: default_calibration_profile(),
-                connection_transport: ConnectionTransport::Unknown,
-                firmware_status: default_firmware_calibration_status(),
-                last_input_snapshot: default_live_input_snapshot(),
-                last_input_emit_at: None,
-                active_keys: HashSet::new(),
-                active_mouse_buttons: HashSet::new(),
-                last_touch_x: None,
-                last_touch_y: None,
-                last_touch_active: false,
-                last_pad_button: false,
-                touch_start_time: None,
-                touch_start_x: 0,
-                touch_start_y: 0,
-                touch_moved: false,
-                peak_finger_count: 0,
-                last_touch_finger_count: 0,
-                click_held_button: None,
-                last_tap_time: None,
-                last_tap_button: None,
-                drag_active: false,
-                drag_button: None,
-            })),
+            controller: Arc::new(Mutex::new(controller_state)),
         }
     }
 }
 
-fn build_output_report(state: &ControllerState) -> [u8; 64] {
-    let mut report = [0u8; 64];
-    report[0] = 0x02;
-    report[1] = 0xFF;
-    report[2] = 0x1 | 0x2 | 0x4 | 0x10 | 0x40;
+fn default_trigger_effect() -> TriggerEffectConfig {
+    reports::default_trigger_effect()
+}
 
-    report[3] = state.rumble_right;
-    report[4] = state.rumble_left;
+fn normalize_trigger_effect(effect: &TriggerEffectConfig) -> TriggerEffectConfig {
+    reports::normalize_trigger_effect(effect)
+}
 
-    report[11] = state.right_mode;
-    match state.right_mode {
-        1 => {
-            report[12] = state.right_start;
-            report[13] = state.right_force;
-        }
-        2 => {
-            report[12] = state.right_start;
-            report[13] = state.right_end;
-            report[14] = state.right_force;
-        }
-        6 => {
-            report[12] = state.right_frequency;
-            report[13] = (state.right_force as u16 * 63 / 255) as u8;
-            report[14] = state.right_start;
-        }
-        0x27 => {
-            report[12] = 0xFF;
-            report[13] = 0xFF;
-            report[14] = (state.right_force >> 5) | ((state.right_force >> 5) << 3);
-            report[15] = state.right_frequency;
-            report[16] = 5;
-        }
-        _ => {}
-    }
-
-    report[22] = state.left_mode;
-    match state.left_mode {
-        1 => {
-            report[23] = state.left_start;
-            report[24] = state.left_force;
-        }
-        2 => {
-            report[23] = state.left_start;
-            report[24] = state.left_end;
-            report[25] = state.left_force;
-        }
-        6 => {
-            report[23] = state.left_frequency;
-            report[24] = (state.left_force as u16 * 63 / 255) as u8;
-            report[25] = state.left_start;
-        }
-        0x27 => {
-            report[23] = 0xFF;
-            report[24] = 0xFF;
-            report[25] = (state.left_force >> 5) | ((state.left_force >> 5) << 3);
-            report[26] = state.left_frequency;
-            report[27] = 5;
-        }
-        _ => {}
-    }
-
-    report[39] = 2;
-    report[42] = 2;
-    report[43] = 0x02;
-    report[44] = 0x04;
-    report[45] = state.r;
-    report[46] = state.g;
-    report[47] = state.b;
-    report
+fn build_output_report(state: &mut ControllerState) -> Vec<u8> {
+    reports::build_output_report(state)
 }
 
 fn build_bindings(
@@ -575,11 +694,65 @@ fn default_firmware_calibration_status() -> FirmwareCalibrationStatus {
     }
 }
 
-fn default_xbox_profile() -> MappingProfile {
+fn target_id_for_emulation_target(target: EmulationTarget) -> TargetId {
+    match target {
+        EmulationTarget::Xbox360 => TargetId::XBOX360_WIRED,
+        EmulationTarget::XboxOne => TargetId {
+            vendor: 0x045E,
+            product: 0x02D1,
+        },
+        EmulationTarget::XboxSeries => TargetId {
+            vendor: 0x045E,
+            product: 0x0B13,
+        },
+        EmulationTarget::DualShock4 => TargetId::DUALSHOCK4_WIRED,
+    }
+}
+
+fn build_virtual_target(bus: &Client, target: EmulationTarget) -> Option<VirtualTarget> {
+    let cloned = bus.try_clone().ok()?;
+    match target {
+        EmulationTarget::DualShock4 => {
+            let mut device = DualShock4Wired::new(cloned, target_id_for_emulation_target(target));
+            device.plugin().ok()?;
+            let _ = device.wait_ready();
+            Some(VirtualTarget::DualShock4(device))
+        }
+        EmulationTarget::Xbox360 | EmulationTarget::XboxOne | EmulationTarget::XboxSeries => {
+            let mut device = Xbox360Wired::new(cloned, target_id_for_emulation_target(target));
+            device.plugin().ok()?;
+            let _ = device.wait_ready();
+            Some(VirtualTarget::Xbox {
+                emulation_target: target,
+                device,
+            })
+        }
+    }
+}
+
+fn ensure_virtual_target(state: &mut ControllerState, target: EmulationTarget) {
+    if state
+        .vigem_target
+        .as_ref()
+        .map(|current| current.matches(target))
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    state.vigem_target = None;
+
+    if let Some(bus) = &state.vigem_bus {
+        state.vigem_target = build_virtual_target(bus, target);
+    }
+}
+
+fn base_xbox_profile(id: &str, name: &str, emulation_target: EmulationTarget) -> MappingProfile {
     MappingProfile {
-        id: "builtin-xbox".to_string(),
-        name: "Xbox 360 Emulation".to_string(),
+        id: id.to_string(),
+        name: name.to_string(),
         built_in: true,
+        emulation_target,
         button_bindings: build_bindings(&[
             (
                 ControllerButton::Cross,
@@ -689,11 +862,36 @@ fn default_xbox_profile() -> MappingProfile {
     }
 }
 
+fn default_xbox_profile() -> MappingProfile {
+    base_xbox_profile(
+        "builtin-xbox360",
+        "Xbox 360 Emulation",
+        EmulationTarget::Xbox360,
+    )
+}
+
+fn default_xbox_one_profile() -> MappingProfile {
+    base_xbox_profile(
+        "builtin-xbox-one",
+        "Xbox One Style Emulation",
+        EmulationTarget::XboxOne,
+    )
+}
+
+fn default_xbox_series_profile() -> MappingProfile {
+    base_xbox_profile(
+        "builtin-xbox-series",
+        "Xbox Series Style Emulation",
+        EmulationTarget::XboxSeries,
+    )
+}
+
 fn default_disabled_profile() -> MappingProfile {
     MappingProfile {
         id: "builtin-disabled".to_string(),
         name: "Disabled".to_string(),
         built_in: true,
+        emulation_target: EmulationTarget::Xbox360,
         button_bindings: build_bindings(&[
             (ControllerButton::Cross, ButtonBindingTarget::Disabled),
             (ControllerButton::Circle, ButtonBindingTarget::Disabled),
@@ -725,10 +923,13 @@ fn default_keyboard_mouse_profile() -> MappingProfile {
         id: "builtin-keyboard-mouse".to_string(),
         name: "Keyboard + Mouse".to_string(),
         built_in: true,
+        emulation_target: EmulationTarget::Xbox360,
         button_bindings: build_bindings(&[
             (
                 ControllerButton::Cross,
-                ButtonBindingTarget::KeyboardKey { key: KeyCode::Space },
+                ButtonBindingTarget::KeyboardKey {
+                    key: KeyCode::Space,
+                },
             ),
             (
                 ControllerButton::Circle,
@@ -776,7 +977,9 @@ fn default_keyboard_mouse_profile() -> MappingProfile {
             ),
             (
                 ControllerButton::Ps,
-                ButtonBindingTarget::KeyboardKey { key: KeyCode::Enter },
+                ButtonBindingTarget::KeyboardKey {
+                    key: KeyCode::Enter,
+                },
             ),
             (ControllerButton::Touchpad, ButtonBindingTarget::Disabled),
             (
@@ -830,9 +1033,132 @@ fn default_keyboard_mouse_profile() -> MappingProfile {
     }
 }
 
+fn default_dualshock4_profile() -> MappingProfile {
+    MappingProfile {
+        id: "builtin-dualshock4".to_string(),
+        name: "DualShock 4 Emulation".to_string(),
+        built_in: true,
+        emulation_target: EmulationTarget::DualShock4,
+        button_bindings: build_bindings(&[
+            (
+                ControllerButton::Cross,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Cross,
+                },
+            ),
+            (
+                ControllerButton::Circle,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Circle,
+                },
+            ),
+            (
+                ControllerButton::Square,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Square,
+                },
+            ),
+            (
+                ControllerButton::Triangle,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Triangle,
+                },
+            ),
+            (
+                ControllerButton::L1,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::L1,
+                },
+            ),
+            (
+                ControllerButton::R1,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::R1,
+                },
+            ),
+            (
+                ControllerButton::Create,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Share,
+                },
+            ),
+            (
+                ControllerButton::Options,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Options,
+                },
+            ),
+            (
+                ControllerButton::L3,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::L3,
+                },
+            ),
+            (
+                ControllerButton::R3,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::R3,
+                },
+            ),
+            (
+                ControllerButton::Ps,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Ps,
+                },
+            ),
+            (
+                ControllerButton::Touchpad,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Touchpad,
+                },
+            ),
+            (ControllerButton::Mute, ButtonBindingTarget::Disabled),
+            (
+                ControllerButton::DpadUp,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Up,
+                },
+            ),
+            (
+                ControllerButton::DpadRight,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Right,
+                },
+            ),
+            (
+                ControllerButton::DpadDown,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Down,
+                },
+            ),
+            (
+                ControllerButton::DpadLeft,
+                ButtonBindingTarget::PlayStationButton {
+                    button: PlayStationButton::Left,
+                },
+            ),
+        ]),
+        left_stick: StickBinding::PlayStationStick {
+            stick: PlayStationStick::Left,
+        },
+        right_stick: StickBinding::PlayStationStick {
+            stick: PlayStationStick::Right,
+        },
+        left_trigger: TriggerBinding::PlayStationTrigger {
+            trigger: PlayStationTrigger::Left,
+        },
+        right_trigger: TriggerBinding::PlayStationTrigger {
+            trigger: PlayStationTrigger::Right,
+        },
+    }
+}
+
 pub fn mapping_presets() -> Vec<MappingProfile> {
     vec![
         default_xbox_profile(),
+        default_xbox_one_profile(),
+        default_xbox_series_profile(),
+        default_dualshock4_profile(),
         default_disabled_profile(),
         default_keyboard_mouse_profile(),
     ]
@@ -840,9 +1166,8 @@ pub fn mapping_presets() -> Vec<MappingProfile> {
 
 pub fn calibration_capabilities() -> CalibrationCapabilities {
     CalibrationCapabilities {
-        // Future firmware calibration should live behind separate USB-only commands.
-        firmware_calibration_available: false,
-        firmware_calibration_note: "Software calibration is implemented here. Permanent DualSense firmware calibration would require a separate USB-only workflow built on undocumented controller commands and stronger safety warnings.".to_string(),
+        firmware_calibration_available: true,
+        firmware_calibration_note: "Firmware calibration is available only for a DualSense connected over USB. It follows the community-documented DualSense center/range workflow and should still be treated as an advanced repair step, especially before any permanent write.".to_string(),
     }
 }
 
@@ -1002,16 +1327,24 @@ fn send_key_event(key: KeyCode, down: bool) {
 #[cfg(not(windows))]
 fn send_key_event(_key: KeyCode, _down: bool) {}
 
-fn parse_touchpad(buf: &[u8]) -> (bool, i32, i32, bool, i32, i32) {
-    let not_touching_0 = (buf[33] >> 7) & 1 == 1;
-    let finger0_x = ((buf[35] as i32 & 0x0F) << 8) | buf[34] as i32;
-    let finger0_y = ((buf[36] as i32) << 4) | ((buf[35] as i32 >> 4) & 0x0F);
+fn parse_touchpad(buf: &[u8], offset_shift: usize) -> (bool, i32, i32, bool, i32, i32) {
+    let base = 33 + offset_shift;
+    let not_touching_0 = (buf[base] >> 7) & 1 == 1;
+    let finger0_x = ((buf[base + 2] as i32 & 0x0F) << 8) | buf[base + 1] as i32;
+    let finger0_y = ((buf[base + 3] as i32) << 4) | ((buf[base + 2] as i32 >> 4) & 0x0F);
 
-    let not_touching_1 = (buf[37] >> 7) & 1 == 1;
-    let finger1_x = ((buf[39] as i32 & 0x0F) << 8) | buf[38] as i32;
-    let finger1_y = ((buf[40] as i32) << 4) | ((buf[39] as i32 >> 4) & 0x0F);
+    let not_touching_1 = (buf[base + 4] >> 7) & 1 == 1;
+    let finger1_x = ((buf[base + 6] as i32 & 0x0F) << 8) | buf[base + 5] as i32;
+    let finger1_y = ((buf[base + 7] as i32) << 4) | ((buf[base + 6] as i32 >> 4) & 0x0F);
 
-    (!not_touching_0, finger0_x, finger0_y, !not_touching_1, finger1_x, finger1_y)
+    (
+        !not_touching_0,
+        finger0_x,
+        finger0_y,
+        !not_touching_1,
+        finger1_x,
+        finger1_y,
+    )
 }
 
 fn parse_dpad(buttons: &mut HashSet<ControllerButton>, dpad: u8) {
@@ -1048,15 +1381,41 @@ fn parse_dpad(buttons: &mut HashSet<ControllerButton>, dpad: u8) {
     }
 }
 
-fn parse_input_report(buf: &[u8], bytes_read: usize) -> Option<DualSenseInputState> {
-    if bytes_read < 11 {
+fn parse_input_report(
+    buf: &[u8],
+    bytes_read: usize,
+    transport: ConnectionTransport,
+) -> Option<DualSenseInputState> {
+    if bytes_read < 2 {
         return None;
     }
 
+    let report_id = buf[0];
+    let (base, touchpad_shift) = match (transport, report_id) {
+        (ConnectionTransport::Bluetooth, DS_INPUT_REPORT_BT) => {
+            if bytes_read < BT_INPUT_REPORT_LEN {
+                return None;
+            }
+
+            let expected_crc = u32::from_le_bytes(buf[bytes_read - 4..bytes_read].try_into().ok()?);
+            if reports::crc32_with_seed(BT_INPUT_CRC_SEED, &buf[..bytes_read - 4]) != expected_crc {
+                return None;
+            }
+
+            (2usize, 1usize)
+        }
+        (ConnectionTransport::Bluetooth, DS_INPUT_REPORT_USB) => {
+            // BT simple-mode 10-byte report; skip until controller switches to full 0x31 reports
+            return None;
+        }
+        (_, DS_INPUT_REPORT_USB) if bytes_read >= 11 => (1usize, 0usize),
+        _ => return None,
+    };
+
     let mut pressed_buttons = HashSet::new();
-    let face_and_dpad = buf[8];
-    let misc = buf[9];
-    let system = buf[10];
+    let face_and_dpad = buf[base + 7];
+    let misc = buf[base + 8];
+    let system = buf[base + 9];
 
     parse_dpad(&mut pressed_buttons, face_and_dpad & 0x0F);
 
@@ -1102,20 +1461,20 @@ fn parse_input_report(buf: &[u8], bytes_read: usize) -> Option<DualSenseInputSta
     }
 
     let (touching_0, finger0_x, finger0_y, touching_1, finger1_x, finger1_y) =
-        if bytes_read >= 41 {
-        parse_touchpad(buf)
-    } else {
-        (false, 0, 0, false, 0, 0)
-    };
+        if bytes_read >= 41 + touchpad_shift {
+            parse_touchpad(buf, touchpad_shift)
+        } else {
+            (false, 0, 0, false, 0, 0)
+        };
 
     Some(DualSenseInputState {
         pressed_buttons,
-        left_stick_x: buf[1],
-        left_stick_y: buf[2],
-        right_stick_x: buf[3],
-        right_stick_y: buf[4],
-        left_trigger: buf[5],
-        right_trigger: buf[6],
+        left_stick_x: buf[base],
+        left_stick_y: buf[base + 1],
+        right_stick_x: buf[base + 2],
+        right_stick_y: buf[base + 3],
+        left_trigger: buf[base + 4],
+        right_trigger: buf[base + 5],
         touching_0,
         finger0_x,
         finger0_y,
@@ -1136,6 +1495,11 @@ fn normalize_trigger(value: u8) -> f32 {
 fn axis_to_thumb(value: f32, invert: bool) -> i16 {
     let normalized = if invert { -value } else { value };
     (normalized.clamp(-1.0, 1.0) * 32767.0).round() as i16
+}
+
+fn axis_to_ds4(value: f32, invert: bool) -> u8 {
+    let normalized = if invert { -value } else { value };
+    (((normalized.clamp(-1.0, 1.0) + 1.0) * 127.5).round()).clamp(0.0, 255.0) as u8
 }
 
 fn apply_deadzone(value: f32, deadzone: f32) -> f32 {
@@ -1201,7 +1565,8 @@ fn build_live_input_snapshot(
         calibration.right_stick.outer_scale,
     );
 
-    let left_trigger_calibrated = calibrate_trigger_value(input.left_trigger, &calibration.left_trigger);
+    let left_trigger_calibrated =
+        calibrate_trigger_value(input.left_trigger, &calibration.left_trigger);
     let right_trigger_calibrated =
         calibrate_trigger_value(input.right_trigger, &calibration.right_trigger);
 
@@ -1250,7 +1615,8 @@ fn update_firmware_eligibility(state: &mut ControllerState) {
 
     if !state.firmware_status.busy && state.firmware_status.step == FirmwareCalibrationStep::Idle {
         state.firmware_status.last_message = if state.firmware_status.eligible {
-            "Firmware calibration is available over USB. Start with a temporary calibration first.".to_string()
+            "Firmware calibration is available over USB. Start with a temporary calibration first."
+                .to_string()
         } else if !state.connected {
             "Connect the DualSense over USB to enable firmware calibration.".to_string()
         } else {
@@ -1279,20 +1645,28 @@ fn reset_firmware_step_controls(state: &mut ControllerState) {
     state.firmware_status.requires_stick_rotation = false;
 }
 
+fn build_feature_report_buffer(report_id: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
+    if payload.len() + 1 > DUALSENSE_FEATURE_REPORT_LEN {
+        return Err(format!(
+            "Firmware payload is too large for the DualSense feature report: {} bytes.",
+            payload.len()
+        ));
+    }
+
+    let mut buf = vec![0u8; DUALSENSE_FEATURE_REPORT_LEN];
+    buf[0] = report_id;
+    buf[1..1 + payload.len()].copy_from_slice(payload);
+    Ok(buf)
+}
+
 fn open_usb_dualsense_for_firmware() -> Result<HidDevice, String> {
     let mut api = HidApi::new().map_err(|e| e.to_string())?;
     let _ = api.refresh_devices();
 
-    for device_info in api.device_list() {
-        if device_info.vendor_id() == SONY_VID
-            && device_info.product_id() == DUALSENSE_PID
-            && device_info.usage_page() == 0x01
-        {
-            return device_info.open_device(&api).map_err(|e| e.to_string());
-        }
-    }
-
-    Err("DualSense USB device not found. Connect the controller with a USB cable and try again.".to_string())
+    open_usb_dualsense_device(&api).ok_or_else(|| {
+        "DualSense USB device not found. Connect the controller with a USB cable and try again."
+            .to_string()
+    })
 }
 
 fn send_feature_report_checked(
@@ -1300,9 +1674,7 @@ fn send_feature_report_checked(
     report_id: u8,
     payload: &[u8],
 ) -> Result<(), String> {
-    let mut buf = Vec::with_capacity(payload.len() + 1);
-    buf.push(report_id);
-    buf.extend_from_slice(payload);
+    let buf = build_feature_report_buffer(report_id, payload)?;
     device.send_feature_report(&buf).map_err(|e| e.to_string())
 }
 
@@ -1311,9 +1683,10 @@ fn get_feature_report_checked(
     report_id: u8,
     expected_len: usize,
 ) -> Result<Vec<u8>, String> {
-    let mut buf = vec![0u8; expected_len + 1];
-    buf[0] = report_id;
-    let bytes_read = device.get_feature_report(&mut buf).map_err(|e| e.to_string())?;
+    let mut buf = build_feature_report_buffer(report_id, &[])?;
+    let bytes_read = device
+        .get_feature_report(&mut buf)
+        .map_err(|e| e.to_string())?;
     if bytes_read == 0 {
         return Err("No response from controller while reading calibration status.".to_string());
     }
@@ -1324,18 +1697,17 @@ fn get_feature_report_checked(
             bytes_read
         ));
     }
-    Ok(buf[1..=expected_len].to_vec())
+    Ok(buf[1..1 + expected_len].to_vec())
+}
+
+fn expected_calibration_ready_response(target_id: u8) -> [u8; 4] {
+    [FIRMWARE_CALIBRATION_DEVICE_ID, target_id, 1, 0xFF]
 }
 
 fn expect_calibration_ready(device: &HidDevice, target_id: u8) -> Result<(), String> {
-    let expected = vec![
-        FIRMWARE_CALIBRATION_DEVICE_ID,
-        target_id,
-        1,
-        0xFF,
-    ];
+    let expected = expected_calibration_ready_response(target_id);
     let response = get_feature_report_checked(device, FIRMWARE_REPORT_GET_CALIBRATION, 4)?;
-    if response != expected {
+    if response.as_slice() != expected {
         return Err(format!(
             "Controller returned an unexpected calibration state: expected {:02x?}, got {:02x?}. Reconnect the controller and try again.",
             expected, response
@@ -1345,10 +1717,7 @@ fn expect_calibration_ready(device: &HidDevice, target_id: u8) -> Result<(), Str
 }
 
 fn nvs_unlock(device: &HidDevice) -> Result<(), String> {
-    let mut payload = vec![
-        FIRMWARE_NVS_DEVICE_ID,
-        FIRMWARE_NVS_UNLOCK_ACTION,
-    ];
+    let mut payload = vec![FIRMWARE_NVS_DEVICE_ID, FIRMWARE_NVS_UNLOCK_ACTION];
     payload.extend_from_slice(&FIRMWARE_NVS_PASSWORD);
     send_feature_report_checked(device, FIRMWARE_REPORT_SET_TEST, &payload)
 }
@@ -1498,10 +1867,82 @@ fn touchpad_click_button(finger_count: u8, touching_0: bool, fx: i32) -> MouseBu
     }
 }
 
+fn playstation_dpad_value(up: bool, right: bool, down: bool, left: bool) -> u8 {
+    match (up, right, down, left) {
+        (true, true, false, false) => 0x01,
+        (false, true, false, false) => 0x02,
+        (false, true, true, false) => 0x03,
+        (false, false, true, false) => 0x04,
+        (false, false, true, true) => 0x05,
+        (false, false, false, true) => 0x06,
+        (true, false, false, true) => 0x07,
+        (true, false, false, false) => 0x00,
+        _ => 0x08,
+    }
+}
+
+fn apply_playstation_button_state(report: &mut DS4Report, pressed: &HashSet<PlayStationButton>) {
+    let mut low = playstation_dpad_value(
+        pressed.contains(&PlayStationButton::Up),
+        pressed.contains(&PlayStationButton::Right),
+        pressed.contains(&PlayStationButton::Down),
+        pressed.contains(&PlayStationButton::Left),
+    );
+    let mut high = 0u8;
+    let mut special = 0u8;
+
+    if pressed.contains(&PlayStationButton::Square) {
+        low |= 1 << 4;
+    }
+    if pressed.contains(&PlayStationButton::Cross) {
+        low |= 1 << 5;
+    }
+    if pressed.contains(&PlayStationButton::Circle) {
+        low |= 1 << 6;
+    }
+    if pressed.contains(&PlayStationButton::Triangle) {
+        low |= 1 << 7;
+    }
+    if pressed.contains(&PlayStationButton::L1) {
+        high |= 1 << 0;
+    }
+    if pressed.contains(&PlayStationButton::R1) {
+        high |= 1 << 1;
+    }
+    if report.trigger_l > 0 {
+        high |= 1 << 2;
+    }
+    if report.trigger_r > 0 {
+        high |= 1 << 3;
+    }
+    if pressed.contains(&PlayStationButton::Share) {
+        high |= 1 << 4;
+    }
+    if pressed.contains(&PlayStationButton::Options) {
+        high |= 1 << 5;
+    }
+    if pressed.contains(&PlayStationButton::L3) {
+        high |= 1 << 6;
+    }
+    if pressed.contains(&PlayStationButton::R3) {
+        high |= 1 << 7;
+    }
+    if pressed.contains(&PlayStationButton::Ps) {
+        special |= 1 << 0;
+    }
+    if pressed.contains(&PlayStationButton::Touchpad) {
+        special |= 1 << 1;
+    }
+
+    report.buttons = u16::from(low) | (u16::from(high) << 8);
+    report.special = special;
+}
+
 fn handle_button_binding(
     target: &ButtonBindingTarget,
     pressed: bool,
     gamepad: &mut XGamepad,
+    playstation_buttons: &mut HashSet<PlayStationButton>,
     desired_keys: &mut HashSet<KeyCode>,
     desired_mouse_buttons: &mut HashSet<MouseButton>,
 ) {
@@ -1513,6 +1954,9 @@ fn handle_button_binding(
         ButtonBindingTarget::Disabled => {}
         ButtonBindingTarget::XboxButton { button } => {
             gamepad.buttons.raw |= xbox_button_bits(*button);
+        }
+        ButtonBindingTarget::PlayStationButton { button } => {
+            playstation_buttons.insert(*button);
         }
         ButtonBindingTarget::KeyboardKey { key } => {
             desired_keys.insert(*key);
@@ -1528,6 +1972,7 @@ fn handle_stick_binding(
     x: f32,
     y: f32,
     gamepad: &mut XGamepad,
+    playstation_report: &mut DS4Report,
     desired_keys: &mut HashSet<KeyCode>,
 ) {
     match binding {
@@ -1540,6 +1985,16 @@ fn handle_stick_binding(
             XboxStick::Right => {
                 gamepad.thumb_rx = axis_to_thumb(x, false);
                 gamepad.thumb_ry = axis_to_thumb(y, true);
+            }
+        },
+        StickBinding::PlayStationStick { stick } => match stick {
+            PlayStationStick::Left => {
+                playstation_report.thumb_lx = axis_to_ds4(x, false);
+                playstation_report.thumb_ly = axis_to_ds4(y, true);
+            }
+            PlayStationStick::Right => {
+                playstation_report.thumb_rx = axis_to_ds4(x, false);
+                playstation_report.thumb_ry = axis_to_ds4(y, true);
             }
         },
         StickBinding::Keyboard4 {
@@ -1582,6 +2037,7 @@ fn handle_trigger_binding(
     binding: &TriggerBinding,
     value: u8,
     gamepad: &mut XGamepad,
+    playstation_report: &mut DS4Report,
     desired_keys: &mut HashSet<KeyCode>,
     desired_mouse_buttons: &mut HashSet<MouseButton>,
 ) {
@@ -1590,6 +2046,10 @@ fn handle_trigger_binding(
         TriggerBinding::XboxTrigger { trigger } => match trigger {
             XboxTrigger::Left => gamepad.left_trigger = value,
             XboxTrigger::Right => gamepad.right_trigger = value,
+        },
+        TriggerBinding::PlayStationTrigger { trigger } => match trigger {
+            PlayStationTrigger::Left => playstation_report.trigger_l = value,
+            PlayStationTrigger::Right => playstation_report.trigger_r = value,
         },
         TriggerBinding::KeyboardKey { key, threshold } => {
             if value >= *threshold {
@@ -1611,6 +2071,8 @@ fn apply_mapping_profile(
 ) {
     let profile = state.mapping_profile.clone();
     let mut gamepad = XGamepad::default();
+    let mut playstation_report = DS4Report::default();
+    let mut playstation_buttons = HashSet::new();
     let mut desired_keys = HashSet::new();
     let mut desired_mouse_buttons = HashSet::new();
 
@@ -1623,6 +2085,7 @@ fn apply_mapping_profile(
             target,
             input.pressed(*button),
             &mut gamepad,
+            &mut playstation_buttons,
             &mut desired_keys,
             &mut desired_mouse_buttons,
         );
@@ -1633,6 +2096,7 @@ fn apply_mapping_profile(
         snapshot.left_stick.calibrated_x,
         snapshot.left_stick.calibrated_y,
         &mut gamepad,
+        &mut playstation_report,
         &mut desired_keys,
     );
     handle_stick_binding(
@@ -1640,6 +2104,7 @@ fn apply_mapping_profile(
         snapshot.right_stick.calibrated_x,
         snapshot.right_stick.calibrated_y,
         &mut gamepad,
+        &mut playstation_report,
         &mut desired_keys,
     );
 
@@ -1647,6 +2112,7 @@ fn apply_mapping_profile(
         &profile.left_trigger,
         snapshot.left_trigger.calibrated_value,
         &mut gamepad,
+        &mut playstation_report,
         &mut desired_keys,
         &mut desired_mouse_buttons,
     );
@@ -1654,17 +2120,25 @@ fn apply_mapping_profile(
         &profile.right_trigger,
         snapshot.right_trigger.calibrated_value,
         &mut gamepad,
+        &mut playstation_report,
         &mut desired_keys,
         &mut desired_mouse_buttons,
     );
 
+    apply_playstation_button_state(&mut playstation_report, &playstation_buttons);
+
     sync_key_state(&mut state.active_keys, &desired_keys);
     sync_mouse_button_state(&mut state.active_mouse_buttons, &desired_mouse_buttons);
 
-    let target_id = state.vigem_target;
-    if let (Some(client), Some(t_id)) = (&mut state.vigem_client, target_id) {
-        let mut target = vigem_client::Xbox360Wired::new(client, t_id);
-        let _ = target.update(&gamepad);
+    if let Some(target) = &mut state.vigem_target {
+        match target {
+            VirtualTarget::Xbox { device, .. } => {
+                let _ = device.update(&gamepad);
+            }
+            VirtualTarget::DualShock4(device) => {
+                let _ = device.update(&playstation_report);
+            }
+        }
     }
 }
 
@@ -1757,7 +2231,7 @@ fn handle_touchpad_mouse(state: &mut ControllerState, input: &DualSenseInputStat
                         let dx = ((current_x - lx) as f64 * sensitivity) as i32;
                         let dy = ((current_y - ly) as f64 * sensitivity) as i32;
                         if dx != 0 || dy != 0 {
-                        send_mouse_move(dx, dy);
+                            send_mouse_move(dx, dy);
                         }
                     }
                 }
@@ -1830,6 +2304,26 @@ fn lock_state(state: &Mutex<ControllerState>) -> std::sync::MutexGuard<'_, Contr
     })
 }
 
+fn apply_adaptive_trigger_override(
+    state: &mut ControllerState,
+    left: TriggerEffectConfig,
+    right: TriggerEffectConfig,
+) {
+    state.adaptive_left_trigger = normalize_trigger_effect(&left);
+    state.adaptive_right_trigger = normalize_trigger_effect(&right);
+    state.adaptive_triggers_active = true;
+    state.left_trigger = state.adaptive_left_trigger.clone();
+    state.right_trigger = state.adaptive_right_trigger.clone();
+    state.output_dirty = true;
+}
+
+fn clear_adaptive_trigger_override(state: &mut ControllerState) {
+    state.adaptive_triggers_active = false;
+    state.left_trigger = state.manual_left_trigger.clone();
+    state.right_trigger = state.manual_right_trigger.clone();
+    state.output_dirty = true;
+}
+
 pub fn get_mapping_profile(state: Arc<Mutex<ControllerState>>) -> MappingProfile {
     let s = lock_state(&state);
     s.mapping_profile.clone()
@@ -1848,6 +2342,29 @@ pub fn set_calibration_profile(state: Arc<Mutex<ControllerState>>, profile: Cali
 pub fn get_live_input_snapshot(state: Arc<Mutex<ControllerState>>) -> LiveInputSnapshot {
     let s = lock_state(&state);
     s.last_input_snapshot.clone()
+}
+
+pub fn get_game_telemetry_status(state: Arc<Mutex<ControllerState>>) -> GameTelemetryStatus {
+    let s = lock_state(&state);
+    s.game_telemetry_status.clone()
+}
+
+pub fn capture_live_ocr_calibration_preview(
+    settings: AdaptiveTriggerRuntimeSettings,
+) -> Result<OcrCalibrationPreview, String> {
+    game_monitor::capture_live_ocr_preview(&settings)
+}
+
+pub fn list_live_ocr_process_options() -> Result<Vec<ActiveProcessOption>, String> {
+    game_monitor::list_live_ocr_processes()
+}
+
+pub fn sync_adaptive_trigger_settings(
+    state: Arc<Mutex<ControllerState>>,
+    settings: AdaptiveTriggerRuntimeSettings,
+) {
+    let mut s = lock_state(&state);
+    s.adaptive_trigger_settings = settings;
 }
 
 pub fn get_firmware_calibration_status(
@@ -2030,7 +2547,14 @@ pub fn save_firmware_calibration_permanently(
     state: Arc<Mutex<ControllerState>>,
 ) -> Result<FirmwareCalibrationStatus, String> {
     let active_mode = {
-        let s = lock_state(&state);
+        let mut s = lock_state(&state);
+        update_firmware_eligibility(&mut s);
+        if !s.firmware_status.eligible {
+            return Err(
+                "Permanent firmware calibration requires a connected DualSense over USB."
+                    .to_string(),
+            );
+        }
         if !s.firmware_status.busy {
             return Err(
                 "Permanent save is only available while a firmware calibration session is ready to store."
@@ -2123,6 +2647,8 @@ pub fn set_mapping_profile(state: Arc<Mutex<ControllerState>>, profile: MappingP
     let mut s = lock_state(&state);
     release_binding_outputs(&mut s);
     s.mapping_profile = profile;
+    let next_target = s.mapping_profile.emulation_target;
+    ensure_virtual_target(&mut s, next_target);
 }
 
 pub fn set_touchpad_enabled(state: Arc<Mutex<ControllerState>>, enabled: bool) {
@@ -2152,29 +2678,31 @@ pub fn set_lightbar(state: Arc<Mutex<ControllerState>>, r: u8, g: u8, b: u8) {
 
 pub fn set_triggers(
     state: Arc<Mutex<ControllerState>>,
-    left_mode: u8,
-    left_force: u8,
-    left_start: u8,
-    left_end: u8,
-    left_frequency: u8,
-    right_mode: u8,
-    right_force: u8,
-    right_start: u8,
-    right_end: u8,
-    right_frequency: u8,
+    left: TriggerEffectConfig,
+    right: TriggerEffectConfig,
 ) {
     let mut s = lock_state(&state);
-    s.left_mode = left_mode;
-    s.left_force = left_force;
-    s.left_start = left_start;
-    s.left_end = left_end;
-    s.left_frequency = left_frequency;
-    s.right_mode = right_mode;
-    s.right_force = right_force;
-    s.right_start = right_start;
-    s.right_end = right_end;
-    s.right_frequency = right_frequency;
+    s.manual_left_trigger = normalize_trigger_effect(&left);
+    s.manual_right_trigger = normalize_trigger_effect(&right);
+    if !s.adaptive_triggers_active {
+        s.left_trigger = s.manual_left_trigger.clone();
+        s.right_trigger = s.manual_right_trigger.clone();
+    }
     s.output_dirty = true;
+}
+
+pub fn set_adaptive_triggers(
+    state: Arc<Mutex<ControllerState>>,
+    left: TriggerEffectConfig,
+    right: TriggerEffectConfig,
+) {
+    let mut s = lock_state(&state);
+    apply_adaptive_trigger_override(&mut s, left, right);
+}
+
+pub fn clear_adaptive_triggers(state: Arc<Mutex<ControllerState>>) {
+    let mut s = lock_state(&state);
+    clear_adaptive_trigger_override(&mut s);
 }
 
 pub fn set_rumble(state: Arc<Mutex<ControllerState>>, left: u8, right: u8) {
@@ -2184,70 +2712,312 @@ pub fn set_rumble(state: Arc<Mutex<ControllerState>>, left: u8, right: u8) {
     s.output_dirty = true;
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioSettings {
+    pub speaker_volume: u8,
+    pub headphone_volume: u8,
+    pub mic_volume: u8,
+    pub mic_mute: bool,
+    pub audio_mute: bool,
+    pub mic_mute_led: u8,
+    pub force_internal_mic: bool,
+    pub force_internal_speaker: bool,
+}
+
+pub fn get_audio(state: Arc<Mutex<ControllerState>>) -> AudioSettings {
+    audio::get_audio(state)
+}
+
+pub fn set_audio(
+    state: Arc<Mutex<ControllerState>>,
+    speaker_volume: u8,
+    headphone_volume: u8,
+    mic_volume: u8,
+    mic_mute: bool,
+    audio_mute: bool,
+    mic_mute_led: u8,
+    force_internal_mic: bool,
+    force_internal_speaker: bool,
+) {
+    audio::set_audio(
+        state,
+        speaker_volume,
+        headphone_volume,
+        mic_volume,
+        mic_mute,
+        audio_mute,
+        mic_mute_led,
+        force_internal_mic,
+        force_internal_speaker,
+    );
+}
+
+pub fn test_speaker(state: Arc<Mutex<ControllerState>>) -> Result<(), String> {
+    audio::test_speaker(state)
+}
+
+pub fn get_audio_test_status(state: Arc<Mutex<ControllerState>>) -> (bool, bool) {
+    audio::get_audio_test_status(state)
+}
+
+pub fn start_mic_test(state: Arc<Mutex<ControllerState>>) -> Result<(), String> {
+    audio::start_mic_test(state)
+}
+
+pub fn stop_mic_test(state: Arc<Mutex<ControllerState>>) {
+    audio::stop_mic_test(state)
+}
+
+fn record_bt_mic_probe_observation(state: &mut ControllerState, report_id: u8, bytes_read: usize) {
+    if !state.bt_mic_probe_active {
+        return;
+    }
+
+    let observation = format!("0x{report_id:02X} ({bytes_read} bytes)");
+    if state
+        .bt_mic_probe_observations
+        .iter()
+        .any(|entry| entry == &observation)
+    {
+        return;
+    }
+    if state.bt_mic_probe_observations.len() >= 8 {
+        return;
+    }
+
+    state.bt_mic_probe_observations.push(observation);
+}
+
 pub fn reset_on_exit(state: Arc<Mutex<ControllerState>>) {
     let mut s = lock_state(&state);
     release_binding_outputs(&mut s);
     release_touchpad_outputs(&mut s);
     reset_touchpad_tracking(&mut s);
+    s.vigem_target = None;
 
     s.touchpad_enabled = false;
     s.touchpad_sensitivity = 1.0;
     s.mapping_profile = default_disabled_profile();
+    s.adaptive_trigger_settings = default_runtime_settings();
+    s.game_telemetry_status = default_game_telemetry_status();
 
-    s.left_mode = 0;
-    s.left_force = 0;
-    s.left_start = 0;
-    s.left_end = 180;
-    s.left_frequency = 30;
-    s.right_mode = 0;
-    s.right_force = 0;
-    s.right_start = 0;
-    s.right_end = 180;
-    s.right_frequency = 30;
+    s.manual_left_trigger = default_trigger_effect();
+    s.manual_right_trigger = default_trigger_effect();
+    s.adaptive_left_trigger = default_trigger_effect();
+    s.adaptive_right_trigger = default_trigger_effect();
+    s.adaptive_triggers_active = false;
+    s.left_trigger = default_trigger_effect();
+    s.right_trigger = default_trigger_effect();
     s.rumble_left = 0;
     s.rumble_right = 0;
 
-    // Clear the custom lightbar on exit so the controller returns to a neutral state.
     s.r = 0;
     s.g = 0;
     s.b = 0;
+
+    s.speaker_volume = 0;
+    s.headphone_volume = 0;
+    s.mic_volume = 0;
+    s.mic_mute = false;
+    s.audio_mute = false;
+    s.mic_mute_led = 0;
+    s.force_internal_mic = false;
+    s.force_internal_speaker = false;
+
+    s.speaker_test_active = false;
+    s.speaker_test_restore_audio = None;
+    s.pending_speaker_restore = false;
+    s.audio_buf.clear();
+    s.audio_buf_offset = 0;
+    s.last_audio_write_at = None;
+
+    if let Some(ref flag) = s.mic_test_stop {
+        flag.store(true, Ordering::Relaxed);
+    }
+    s.mic_test_active = false;
+    s.mic_test_stop = None;
+    s.bt_mic_probe_active = false;
+    s.bt_mic_probe_observations.clear();
+
     s.output_dirty = s.connected;
+}
+
+fn transport_from_device_info(device_info: &DeviceInfo) -> Option<ConnectionTransport> {
+    if device_info.vendor_id() != SONY_VID {
+        return None;
+    }
+    if !matches!(device_info.product_id(), DUALSENSE_PID | DUALSENSE_EDGE_PID) {
+        return None;
+    }
+    match device_info.bus_type() {
+        BusType::Bluetooth => Some(ConnectionTransport::Bluetooth),
+        _ => Some(ConnectionTransport::Usb),
+    }
+}
+
+fn open_usb_dualsense_device(api: &HidApi) -> Option<HidDevice> {
+    let mut fallback: Option<HidDevice> = None;
+
+    for device_info in api.device_list() {
+        if transport_from_device_info(device_info) != Some(ConnectionTransport::Usb) {
+            continue;
+        }
+
+        let usage_page = device_info.usage_page();
+        let usage = device_info.usage();
+        let preferred_collection = usage_page == 0x01 && matches!(usage, 0x04 | 0x05);
+        let fallback_collection = usage_page == 0x01;
+        if !preferred_collection && !fallback_collection {
+            continue;
+        }
+
+        match device_info.open_device(api) {
+            Ok(opened_device) => {
+                if preferred_collection {
+                    return Some(opened_device);
+                }
+                if fallback.is_none() {
+                    fallback = Some(opened_device);
+                }
+            }
+            Err(err) => {
+                let path = device_info.path().to_string_lossy();
+                eprintln!(
+                    "DualSense USB open failed: usage_page=0x{usage_page:04X} usage=0x{usage:04X} path={path} error={err}"
+                );
+            }
+        }
+    }
+
+    fallback
+}
+
+fn open_dualsense_device(api: &HidApi) -> Option<(HidDevice, ConnectionTransport)> {
+    let mut fallback: Option<(HidDevice, ConnectionTransport)> = None;
+
+    for device_info in api.device_list() {
+        let Some(transport) = transport_from_device_info(device_info) else {
+            continue;
+        };
+
+        let usage_page = device_info.usage_page();
+        let usage = device_info.usage();
+        let preferred_collection = usage_page == 0x01 && matches!(usage, 0x04 | 0x05);
+        let fallback_collection = usage_page == 0x01;
+        if !preferred_collection && !fallback_collection {
+            continue;
+        }
+
+        match device_info.open_device(api) {
+            Ok(opened_device) => {
+                if preferred_collection {
+                    return Some((opened_device, transport));
+                }
+                if fallback.is_none() {
+                    fallback = Some((opened_device, transport));
+                }
+            }
+            Err(err) => {
+                let path = device_info.path().to_string_lossy();
+                eprintln!(
+                    "DualSense open failed: transport={transport:?} usage_page=0x{usage_page:04X} usage=0x{usage:04X} path={path} error={err}"
+                );
+            }
+        }
+    }
+
+    fallback
+}
+
+pub fn start_game_monitor(state: Arc<Mutex<ControllerState>>, app_handle: AppHandle) {
+    thread::spawn(move || {
+        let mut runtime = game_monitor::GameMonitorRuntime::new();
+        let mut last_emitted_status: Option<GameTelemetryStatus> = None;
+
+        loop {
+            let settings = {
+                let current_state = lock_state(&state);
+                current_state.adaptive_trigger_settings.clone()
+            };
+
+            let snapshot = runtime.poll(&settings);
+            let status = snapshot.status;
+            let effects = snapshot.effects;
+
+            {
+                let mut current_state = lock_state(&state);
+                current_state.game_telemetry_status = status.clone();
+
+                if settings.enabled
+                    && settings.input_source == AdaptiveTriggerInputSource::Live
+                    && effects.is_none()
+                    && current_state.adaptive_triggers_active
+                {
+                    clear_adaptive_trigger_override(&mut current_state);
+                }
+
+                if let Some((left, right)) = effects {
+                    apply_adaptive_trigger_override(&mut current_state, left, right);
+                }
+            }
+
+            if last_emitted_status.as_ref() != Some(&status) {
+                let _ = app_handle.emit("game-telemetry-status", status.clone());
+                last_emitted_status = Some(status);
+            }
+
+            thread::sleep(Duration::from_millis(150));
+        }
+    });
+}
+
+const RECONNECT_DELAY_MIN_MS: u64 = 100;
+const RECONNECT_DELAY_MAX_MS: u64 = 2000;
+const RECONNECT_RETRY_PAUSE_MS: u64 = 250;
+const LIVENESS_WATCHDOG_SECS: u64 = 5;
+
+fn try_open_dualsense() -> Option<(HidDevice, ConnectionTransport)> {
+    let api = HidApi::new().ok()?;
+    open_dualsense_device(&api)
+}
+
+fn attempt_dualsense_connection() -> Option<(HidDevice, ConnectionTransport)> {
+    if let Some(result) = try_open_dualsense() {
+        return Some(result);
+    }
+
+    thread::sleep(Duration::from_millis(RECONNECT_RETRY_PAUSE_MS));
+    try_open_dualsense()
 }
 
 pub fn start_controller_listener(state: Arc<Mutex<ControllerState>>, app_handle: AppHandle) {
     thread::spawn(move || {
-        let mut api = HidApi::new().expect("Failed to initialize HidApi");
         let mut device: Option<HidDevice> = None;
+        let mut device_transport = ConnectionTransport::Unknown;
+        let mut bt_write_failures = 0u8;
+        let mut reconnect_delay_ms: u64 = RECONNECT_DELAY_MIN_MS;
+        let mut last_successful_read = Instant::now();
 
         loop {
             if device.is_none() {
-                let _ = api.refresh_devices();
-                for device_info in api.device_list() {
-                    if device_info.vendor_id() == SONY_VID
-                        && (device_info.product_id() == DUALSENSE_PID
-                            || device_info.product_id() == DUALSENSE_PID_BT)
-                        && device_info.usage_page() == 0x01
-                    {
-                        if let Ok(opened_device) = device_info.open_device(&api) {
-                            println!("DualSense Connected (usage_page=0x01)!");
-                            device = Some(opened_device);
-                            let mut current_state = lock_state(&state);
-                            current_state.connected = true;
-                            current_state.connection_transport = if device_info.product_id() == DUALSENSE_PID {
-                                ConnectionTransport::Usb
-                            } else {
-                                ConnectionTransport::Bluetooth
-                            };
-                            current_state.output_dirty = true;
-                            current_state.last_input_snapshot.connected = true;
-                            update_firmware_eligibility(&mut current_state);
-                            let firmware_status = current_state.firmware_status.clone();
-                            drop(current_state);
-                            let _ = app_handle.emit("controller-status", true);
-                            let _ = app_handle.emit("firmware-calibration-status", firmware_status);
-                            break;
-                        }
-                    }
+                if let Some((opened_device, transport)) = attempt_dualsense_connection() {
+                    println!("DualSense Connected ({transport:?})!");
+                    bt_write_failures = 0;
+                    reconnect_delay_ms = RECONNECT_DELAY_MIN_MS;
+                    last_successful_read = Instant::now();
+                    device_transport = transport;
+                    device = Some(opened_device);
+                    let mut current_state = lock_state(&state);
+                    current_state.connected = true;
+                    current_state.connection_transport = transport;
+                    current_state.output_dirty = true;
+                    current_state.last_input_snapshot.connected = true;
+                    update_firmware_eligibility(&mut current_state);
+                    let firmware_status = current_state.firmware_status.clone();
+                    drop(current_state);
+                    let _ = app_handle.emit("controller-status", true);
+                    let _ = app_handle.emit("firmware-calibration-status", firmware_status);
                 }
             }
 
@@ -2263,10 +3033,16 @@ pub fn start_controller_listener(state: Arc<Mutex<ControllerState>>, app_handle:
             }
 
             if let Some(device_ref) = device.as_ref() {
-                let mut buf = [0u8; 64];
+                let mut buf = [0u8; MAX_HID_REPORT_LEN];
                 match device_ref.read_timeout(&mut buf, 2) {
                     Ok(bytes_read) if bytes_read > 0 => {
-                        if let Some(input) = parse_input_report(&buf, bytes_read) {
+                        last_successful_read = Instant::now();
+                        if device_transport == ConnectionTransport::Bluetooth {
+                            let mut current_state = lock_state(&state);
+                            record_bt_mic_probe_observation(&mut current_state, buf[0], bytes_read);
+                        }
+                        if let Some(input) = parse_input_report(&buf, bytes_read, device_transport)
+                        {
                             let mut current_state = lock_state(&state);
                             let snapshot = build_live_input_snapshot(
                                 current_state.connected,
@@ -2285,17 +3061,23 @@ pub fn start_controller_listener(state: Arc<Mutex<ControllerState>>, app_handle:
 
                             apply_mapping_profile(&mut current_state, &input, &snapshot);
 
-                            if current_state.touchpad_enabled && bytes_read >= 41 {
+                            if current_state.touchpad_enabled {
                                 handle_touchpad_mouse(&mut current_state, &input);
                             }
 
                             drop(current_state);
+                            bt_write_failures = 0;
                             if should_emit {
                                 let _ = app_handle.emit("controller-input", snapshot);
                             }
                         }
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if last_successful_read.elapsed() > Duration::from_secs(LIVENESS_WATCHDOG_SECS) {
+                            eprintln!("DualSense watchdog: no data for {LIVENESS_WATCHDOG_SECS}s, forcing reconnect");
+                            disconnected = true;
+                        }
+                    }
                     Err(err) => {
                         eprintln!("DualSense read error: {err}");
                         disconnected = true;
@@ -2305,9 +3087,19 @@ pub fn start_controller_listener(state: Arc<Mutex<ControllerState>>, app_handle:
 
             if let Some(device_ref) = device.as_ref() {
                 let report_to_send = {
-                    let current_state = lock_state(&state);
-                    if current_state.output_dirty && current_state.connected {
-                        Some(build_output_report(&current_state))
+                    let mut current_state = lock_state(&state);
+                    let audio_due = current_state.speaker_test_active
+                        && current_state.audio_buf_offset < current_state.audio_buf.len()
+                        && current_state
+                            .last_audio_write_at
+                            .map(|t| t.elapsed().as_millis() >= AUDIO_WRITE_INTERVAL_MS)
+                            .unwrap_or(true);
+
+                    if (current_state.output_dirty || audio_due) && current_state.connected {
+                        if audio_due {
+                            current_state.last_audio_write_at = Some(Instant::now());
+                        }
+                        Some(build_output_report(&mut current_state))
                     } else {
                         None
                     }
@@ -2316,10 +3108,18 @@ pub fn start_controller_listener(state: Arc<Mutex<ControllerState>>, app_handle:
                 if let Some(report) = report_to_send {
                     if let Err(err) = device_ref.write(&report) {
                         eprintln!("DualSense write error: {err}");
-                        disconnected = true;
+                        if device_transport == ConnectionTransport::Bluetooth {
+                            bt_write_failures = bt_write_failures.saturating_add(1);
+                            disconnected = bt_write_failures >= BT_WRITE_FAILURE_THRESHOLD;
+                        } else {
+                            disconnected = true;
+                        }
                     } else {
                         let mut current_state = lock_state(&state);
-                        current_state.output_dirty = false;
+                        if !audio::complete_pending_speaker_restore(&mut current_state) {
+                            current_state.output_dirty = false;
+                        }
+                        bt_write_failures = 0;
                     }
                 }
             }
@@ -2327,6 +3127,8 @@ pub fn start_controller_listener(state: Arc<Mutex<ControllerState>>, app_handle:
             if disconnected {
                 println!("DualSense Disconnected!");
                 device = None;
+                device_transport = ConnectionTransport::Unknown;
+                bt_write_failures = 0;
                 let mut current_state = lock_state(&state);
                 release_binding_outputs(&mut current_state);
                 release_touchpad_outputs(&mut current_state);
@@ -2349,8 +3151,73 @@ pub fn start_controller_listener(state: Arc<Mutex<ControllerState>>, app_handle:
             }
 
             if device.is_none() {
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(reconnect_delay_ms));
+                reconnect_delay_ms = (reconnect_delay_ms * 2).min(RECONNECT_DELAY_MAX_MS);
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapping_presets_cover_xbox_and_playstation_targets() {
+        let presets = mapping_presets();
+
+        assert!(presets
+            .iter()
+            .any(|profile| profile.emulation_target == EmulationTarget::Xbox360));
+        assert!(presets
+            .iter()
+            .any(|profile| profile.emulation_target == EmulationTarget::XboxOne));
+        assert!(presets
+            .iter()
+            .any(|profile| profile.emulation_target == EmulationTarget::XboxSeries));
+        assert!(presets
+            .iter()
+            .any(|profile| profile.emulation_target == EmulationTarget::DualShock4));
+    }
+
+    #[test]
+    fn playstation_report_encodes_face_buttons_dpad_and_special_bits() {
+        let mut report = DS4Report::default();
+        let pressed = HashSet::from([
+            PlayStationButton::Up,
+            PlayStationButton::Cross,
+            PlayStationButton::Options,
+            PlayStationButton::Ps,
+        ]);
+
+        apply_playstation_button_state(&mut report, &pressed);
+
+        assert_eq!(report.buttons & 0x000F, 0x0000);
+        assert_ne!(report.buttons & 0x0020, 0);
+        assert_ne!(report.buttons & 0x2000, 0);
+        assert_eq!(report.special & 0x01, 0x01);
+    }
+
+    #[test]
+    fn firmware_feature_report_buffers_are_padded_for_windows_hidapi() {
+        let payload = [FIRMWARE_ACTION_START, FIRMWARE_CALIBRATION_DEVICE_ID, FIRMWARE_CENTER_TARGET_ID];
+        let buf = build_feature_report_buffer(FIRMWARE_REPORT_SET_CALIBRATION, &payload).unwrap();
+
+        assert_eq!(buf.len(), DUALSENSE_FEATURE_REPORT_LEN);
+        assert_eq!(buf[0], FIRMWARE_REPORT_SET_CALIBRATION);
+        assert_eq!(&buf[1..4], &payload);
+        assert!(buf[4..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn calibration_ready_response_matches_expected_targets() {
+        assert_eq!(
+            expected_calibration_ready_response(FIRMWARE_CENTER_TARGET_ID),
+            [FIRMWARE_CALIBRATION_DEVICE_ID, FIRMWARE_CENTER_TARGET_ID, 1, 0xFF]
+        );
+        assert_eq!(
+            expected_calibration_ready_response(FIRMWARE_RANGE_TARGET_ID),
+            [FIRMWARE_CALIBRATION_DEVICE_ID, FIRMWARE_RANGE_TARGET_ID, 1, 0xFF]
+        );
+    }
 }
